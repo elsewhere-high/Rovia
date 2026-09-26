@@ -1,0 +1,194 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-rovia}
+      POSTGRES_USER: ${POSTGRES_USER:-rovia}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_for_local_development}
+    volumes:
+      - rovia_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rovia} -d ${POSTGRES_DB:-rovia}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - rovia_redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    # Load project-local credentials as service variables.  Semantic agents
+    # use the provider-neutral LLM_* contract; the ignored .env file is the
+    # source of truth and legacy provider names are migration-only.
+    env_file:
+      - .env
+    environment:
+      APP_ENV: docker
+      TZ: Asia/Shanghai
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rovia}:${POSTGRES_PASSWORD:-change_me_for_local_development}@postgres:5432/${POSTGRES_DB:-rovia}
+      REDIS_URL: redis://redis:6379/0
+      AMAP_WEBSERVICE_KEY: ${AMAP_WEBSERVICE_KEY:-}
+      OPENTRIPMAP_API_KEY: ${OPENTRIPMAP_API_KEY:-}
+      FLYAI_API_KEY: ${FLYAI_API_KEY:-}
+      TRAIN_FALLBACK_URL: ${TRAIN_FALLBACK_URL:-https://api.lolimi.cn/API/hc/api}
+      MCP_12306_URL: ${MCP_12306_URL:-}
+      FLIGHT_FALLBACK_URL: ${FLIGHT_FALLBACK_URL:-https://open.6api.net/flight/getTicket}
+      FLIGHT_FALLBACK_API_KEY: ${FLIGHT_FALLBACK_API_KEY:-}
+      AVIATIONSTACK_URL: ${AVIATIONSTACK_URL:-https://api.aviationstack.com/v1/flights}
+      AVIATIONSTACK_API_KEY: ${AVIATIONSTACK_API_KEY:-}
+      OIL_API_URL: ${OIL_API_URL:-https://www.mxnzp.com/api/oil/search}
+      OIL_APP_ID: ${OIL_APP_ID:-}
+      OIL_APP_SECRET: ${OIL_APP_SECRET:-}
+      # Canonical provider configuration.  Change these values in .env to
+      # switch provider/model without rebuilding agent code.
+      LLM_PROVIDER: ${LLM_PROVIDER:-configured}
+      LLM_API_URL: ${LLM_API_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_STYLE: ${LLM_API_STYLE:-openai}
+      LLM_THINKING: ${LLM_THINKING:-false}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-32768}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-90}
+      # Legacy aliases are retained for old .env files only.  The canonical
+      # LLM_* values above always take precedence when supplied.
+      OLLAMA_API_URL: ${OLLAMA_API_URL:-}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      DEEPSEEK_API_URL: ${DEEPSEEK_API_URL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-}
+      DEEPSEEK_REASONING_EFFORT: ${DEEPSEEK_REASONING_EFFORT:-}
+      DEEPSEEK_THINKING: ${DEEPSEEK_THINKING:-false}
+      DEEPSEEK_MAX_TOKENS: ${DEEPSEEK_MAX_TOKENS:-0}
+      DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-0}
+      # Docker Desktop cannot use a host-only 127.0.0.1 proxy address. Set
+      # ROVIA_HTTP_PROXY to the host-reachable proxy URL when one is used
+      # (for example http://host.docker.internal:7890).
+      HTTP_PROXY: ${ROVIA_HTTP_PROXY:-}
+      HTTPS_PROXY: ${ROVIA_HTTP_PROXY:-}
+      NO_PROXY: ${ROVIA_NO_PROXY:-localhost,127.0.0.1,postgres,redis}
+      NODE_USE_ENV_PROXY: "1"
+      ENABLE_ROUTE_ELEVATION: "true"
+      LOAD_LOCAL_SKILL_CREDENTIALS: "false"
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080}
+      UPLOAD_DIR: /app/data/uploads
+      FILE_RETENTION_DAYS: ${FILE_RETENTION_DAYS:-30}
+    ports:
+      # Expose the API on loopback for local tooling and Playwright. The
+      # frontend still reaches it internally through the Docker network.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - rovia_uploads:/app/data/uploads
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 8s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    command: ["arq", "app.workers.main.WorkerSettings"]
+    # Keep worker and API on the exact same provider-neutral LLM configuration.
+    env_file:
+      - .env
+    environment:
+      APP_ENV: docker
+      TZ: Asia/Shanghai
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-rovia}:${POSTGRES_PASSWORD:-change_me_for_local_development}@postgres:5432/${POSTGRES_DB:-rovia}
+      REDIS_URL: redis://redis:6379/0
+      AMAP_WEBSERVICE_KEY: ${AMAP_WEBSERVICE_KEY:-}
+      OPENTRIPMAP_API_KEY: ${OPENTRIPMAP_API_KEY:-}
+      FLYAI_API_KEY: ${FLYAI_API_KEY:-}
+      TRAIN_FALLBACK_URL: ${TRAIN_FALLBACK_URL:-https://api.lolimi.cn/API/hc/api}
+      MCP_12306_URL: ${MCP_12306_URL:-}
+      FLIGHT_FALLBACK_URL: ${FLIGHT_FALLBACK_URL:-https://open.6api.net/flight/getTicket}
+      FLIGHT_FALLBACK_API_KEY: ${FLIGHT_FALLBACK_API_KEY:-}
+      AVIATIONSTACK_URL: ${AVIATIONSTACK_URL:-https://api.aviationstack.com/v1/flights}
+      AVIATIONSTACK_API_KEY: ${AVIATIONSTACK_API_KEY:-}
+      OIL_API_URL: ${OIL_API_URL:-https://www.mxnzp.com/api/oil/search}
+      OIL_APP_ID: ${OIL_APP_ID:-}
+      OIL_APP_SECRET: ${OIL_APP_SECRET:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-configured}
+      LLM_API_URL: ${LLM_API_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_STYLE: ${LLM_API_STYLE:-openai}
+      LLM_THINKING: ${LLM_THINKING:-false}
+      LLM_MAX_TOKENS: ${LLM_MAX_TOKENS:-32768}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-90}
+      OLLAMA_API_URL: ${OLLAMA_API_URL:-}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      DEEPSEEK_API_URL: ${DEEPSEEK_API_URL:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-}
+      DEEPSEEK_REASONING_EFFORT: ${DEEPSEEK_REASONING_EFFORT:-}
+      DEEPSEEK_THINKING: ${DEEPSEEK_THINKING:-false}
+      DEEPSEEK_MAX_TOKENS: ${DEEPSEEK_MAX_TOKENS:-0}
+      DEEPSEEK_TIMEOUT_SECONDS: ${DEEPSEEK_TIMEOUT_SECONDS:-0}
+      HTTP_PROXY: ${ROVIA_HTTP_PROXY:-}
+      HTTPS_PROXY: ${ROVIA_HTTP_PROXY:-}
+      NO_PROXY: ${ROVIA_NO_PROXY:-localhost,127.0.0.1,postgres,redis}
+      NODE_USE_ENV_PROXY: "1"
+      ENABLE_ROUTE_ELEVATION: "true"
+      LOAD_LOCAL_SKILL_CREDENTIALS: "false"
+      UPLOAD_DIR: /app/data/uploads
+      FILE_RETENTION_DAYS: ${FILE_RETENTION_DAYS:-30}
+    volumes:
+      - rovia_uploads:/app/data/uploads
+    depends_on:
+      backend:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_AMAP_JSAPI_KEY: ${VITE_AMAP_JSAPI_KEY:-}
+        VITE_AMAP_SECURITY_JS_CODE: ${VITE_AMAP_SECURITY_JS_CODE:-}
+        VITE_AMAP_SERVICE_HOST: ${VITE_AMAP_SERVICE_HOST:-}
+        HTTP_PROXY: ${ROVIA_HTTP_PROXY:-}
+        HTTPS_PROXY: ${ROVIA_HTTP_PROXY:-}
+        NO_PROXY: ${ROVIA_NO_PROXY:-localhost,127.0.0.1}
+        ROVIA_HTTPS: ${ROVIA_HTTPS:-false}
+        ROVIA_SERVER_NAME: ${ROVIA_SERVER_NAME:-_}
+    ports:
+      # Bind the unified web entrypoint on every host interface so other
+      # devices on the same LAN can open http://<host-ip>:8080.
+      - "0.0.0.0:8080:80"
+      # Optional local HTTPS entrypoint. Certificate files
+      # fullchain.pem + privkey.pem must exist under ./rovia-certs.
+      - "0.0.0.0:7443:443"
+    volumes:
+      - ./rovia-certs:/etc/nginx/certs:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  rovia_postgres:
+  rovia_redis:
+  rovia_uploads:

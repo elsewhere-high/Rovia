@@ -1,0 +1,54 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+Skills/**/apikey.txt
+Skills/**/secretkey.txt
+Skills/**/apipkey.txt
+*.pem
+*.key
+rovia-certs/
+
+# Python environments and caches
+.conda/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+
+# Node dependencies and generated assets
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+frontend/public/draco/
+
+# User data and local outputs
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+data/
+uploads/
+backups/
+logs/
+*.log
+test-results/
+playwright-report/
+evaluation/results/
+artifacts/
+output/
+tmp/
+
+# Local editor and operating-system files
+.DS_Store
+.idea/
+.vscode/
+.history/

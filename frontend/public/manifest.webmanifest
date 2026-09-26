@@ -1,0 +1,10 @@
+{
+  "name": "Rovia",
+  "short_name": "Rovia",
+  "description": "把远方排进日常 · 旅行规划工作台",
+  "start_url": "/home",
+  "display": "standalone",
+  "background_color": "#f8f5ee",
+  "theme_color": "#164d40",
+  "icons": [{"src": "/rovia-mark.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}]
+}

@@ -1,0 +1,947 @@
+<script setup lang="ts">
+import AMapLoader from '@amap/amap-jsapi-loader'
+import { computed, nextTick, onBeforeUnmount, onMounted, shallowRef, watch } from 'vue'
+import type { DayPlan } from '../../types/trip'
+import MockRouteMap from './MockRouteMap.vue'
+
+const props = defineProps<{ day?: DayPlan; activeStageId?: string; pickEnabled?: boolean }>()
+const emit = defineEmits<{
+  selectStage: [stageId: string]
+  selectActivity: [activityId: string]
+  pointSelected: [point: { name: string; address?: string; longitude: number; latitude: number }]
+}>()
+
+const containerId = `rovia-amap-${Math.random().toString(36).slice(2)}`
+const map = shallowRef<any>(null)
+const AMap = shallowRef<any>(null)
+const routeOverlays = shallowRef<Array<{ stageId: string; polyline: any }>>([])
+const otherOverlays = shallowRef<any[]>([])
+const pickedMarker = shallowRef<any>(null)
+type TravelMode = 'driving' | 'riding' | 'walking' | 'transit'
+type IntercityMode = 'train' | 'flight' | 'ferry'
+type PlannedRoute = { path: any[]; mode: TravelMode | IntercityMode | 'direct'; fallback: boolean }
+type MarkerKind = 'start' | 'end' | 'attraction' | 'charging' | 'fueling' | 'meal' | 'rest' | 'hotel' | 'parking' | 'service'
+const routePathCache = shallowRef(new Map<string, PlannedRoute>())
+const loading = shallowRef(true)
+const routeLoading = shallowRef(false)
+const routeUnavailable = shallowRef(false)
+const failed = shallowRef(false)
+// Browser credentials must be supplied at build time. Never import local key
+// files here: Vite would embed their contents into the public JavaScript bundle.
+const amapKey = (import.meta.env.VITE_AMAP_JSAPI_KEY || '').trim()
+const securityCode = (import.meta.env.VITE_AMAP_SECURITY_JS_CODE || '').trim()
+const serviceHost = (import.meta.env.VITE_AMAP_SERVICE_HOST || '').trim()
+const hasCredentials = computed(() => Boolean(amapKey))
+
+function escapeHtml(value: string) {
+  return value.replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;',
+  })[character] ?? character)
+}
+
+function activityMarkerKind(type: string): MarkerKind {
+  const normalized = type.toLowerCase()
+  if (normalized.includes('charg')) return 'charging'
+  if (normalized.includes('fuel') || normalized.includes('gas')) return 'fueling'
+  if (normalized.includes('meal') || normalized.includes('food') || normalized.includes('restaurant')) return 'meal'
+  if (normalized.includes('hotel') || normalized.includes('lodg')) return 'hotel'
+  if (normalized.includes('park')) return 'parking'
+  if (normalized.includes('rest') || normalized.includes('toilet')) return 'rest'
+  if (normalized.includes('attraction') || normalized.includes('scenic')) return 'attraction'
+  return 'service'
+}
+
+function markerIcon(kind: MarkerKind) {
+  return {
+    start: '起',
+    end: '终',
+    attraction: '景',
+    charging: '⚡',
+    fueling: '⛽',
+    meal: '餐',
+    rest: '休',
+    hotel: '宿',
+    parking: 'P',
+    service: '服',
+  }[kind]
+}
+
+function extractServicePath(mode: TravelMode, result: any): any[] {
+  if (mode === 'transit') {
+    return (result?.plans?.[0]?.segments ?? []).flatMap((segment: any) => [
+      ...(segment.walking?.path ?? []),
+      ...(segment.transit?.path ?? []),
+    ])
+  }
+  const route = result?.routes?.[0]
+  if (mode === 'riding') return (route?.rides ?? []).flatMap((ride: any) => ride.path ?? [])
+  return (route?.steps ?? []).flatMap((step: any) => step.path ?? [])
+}
+
+function searchByMode(
+  mode: TravelMode,
+  start: { longitude: number; latitude: number },
+  end: { longitude: number; latitude: number },
+  city?: string,
+  waypoints: Array<{ longitude: number; latitude: number }> = [],
+): Promise<any[]> {
+  return new Promise((resolve) => {
+    const Service = AMap.value?.[
+      { driving: 'Driving', riding: 'Riding', walking: 'Walking', transit: 'Transfer' }[mode]
+    ]
+    if (!Service || (mode === 'transit' && !city)) {
+      resolve([])
+      return
+    }
+    let settled = false
+    const finish = (path: any[]) => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timeout)
+      resolve(path.length >= 2 ? path : [])
+    }
+    const timeout = window.setTimeout(() => finish([]), 6_000)
+    const options = mode === 'driving'
+      ? {
+          policy: AMap.value.DrivingPolicy.LEAST_TIME,
+          extensions: 'base',
+          hideMarkers: true,
+          showTraffic: false,
+        }
+      : mode === 'transit'
+        ? { city, policy: AMap.value.TransferPolicy.LEAST_TIME, hideMarkers: true }
+        : { hideMarkers: true }
+    const service = new Service(options)
+    const origin = new AMap.value.LngLat(start.longitude, start.latitude)
+    const destination = new AMap.value.LngLat(end.longitude, end.latitude)
+    const callback = (status: string, result: any) => {
+      const servicePath = status === 'complete' ? extractServicePath(mode, result) : []
+      finish(servicePath.length >= 2 ? [origin, ...servicePath, destination] : [])
+    }
+    if (mode === 'driving') {
+      service.search(
+        origin,
+        destination,
+        {
+          waypoints: waypoints.map((point) => new AMap.value.LngLat(point.longitude, point.latitude)),
+        },
+        callback,
+      )
+    } else {
+      service.search(origin, destination, callback)
+    }
+  })
+}
+
+async function routeWithFallback(
+  cacheKey: string,
+  start: { longitude: number; latitude: number },
+  end: { longitude: number; latitude: number },
+  city?: string,
+  waypoints: Array<{ longitude: number; latitude: number }> = [],
+  preferredMode: TravelMode = 'driving',
+): Promise<PlannedRoute> {
+  // A stage id can survive an edit while its endpoints move. Include the
+  // geometry in the cache key so a re-render cannot reuse yesterday's local
+  // connector and leave an apparent gap between the sidebar and the map.
+  const geometryKey = [
+    cacheKey,
+    `${start.longitude.toFixed(6)},${start.latitude.toFixed(6)}`,
+    `${end.longitude.toFixed(6)},${end.latitude.toFixed(6)}`,
+    city || '',
+    preferredMode,
+    ...waypoints.map((point) => `${point.longitude.toFixed(6)},${point.latitude.toFixed(6)}`),
+  ].join('|')
+  const cached = routePathCache.value.get(geometryKey)
+  if (cached) return cached
+  const modes = [
+    preferredMode,
+    ...(['driving', 'riding', 'walking', 'transit'] as TravelMode[]),
+  ].filter((mode, index, items) => items.indexOf(mode) === index)
+  for (const mode of modes) {
+    const path = await searchByMode(mode, start, end, city, mode === 'driving' ? waypoints : [])
+    if (path.length >= 2) {
+      const result: PlannedRoute = { path, mode, fallback: mode !== preferredMode }
+      routePathCache.value.set(geometryKey, result)
+      return result
+    }
+  }
+  const result: PlannedRoute = {
+    path: [[start.longitude, start.latitude], [end.longitude, end.latitude]],
+    mode: 'direct',
+    fallback: true,
+  }
+  routePathCache.value.set(geometryKey, result)
+  return result
+}
+
+type RoutePoint = [number, number]
+
+function routePointDistance(left: RoutePoint, right: RoutePoint) {
+  return Math.hypot(left[0] - right[0], left[1] - right[1])
+}
+
+function anchorRoutePath(
+  path: RoutePoint[],
+  start?: { longitude: number; latitude: number },
+  end?: { longitude: number; latitude: number },
+): RoutePoint[] {
+  const clean = path.filter((point) =>
+    Array.isArray(point)
+    && point.length >= 2
+    && Number.isFinite(Number(point[0]))
+    && Number.isFinite(Number(point[1])),
+  ) as RoutePoint[]
+  if (!clean.length) return clean
+  const anchored = clean.map((point) => [Number(point[0]), Number(point[1])] as RoutePoint)
+  const startPoint: RoutePoint | undefined = start
+    ? [start.longitude, start.latitude]
+    : undefined
+  const endPoint: RoutePoint | undefined = end
+    ? [end.longitude, end.latitude]
+    : undefined
+  // Provider road polylines often omit the exact geocoded endpoint by a few
+  // dozen metres. Add a tiny terminal link so every visible stage starts and
+  // ends at the same coordinate as its card and marker.
+  if (startPoint && routePointDistance(anchored[0], startPoint) > 0.00001) {
+    anchored.unshift(startPoint)
+  }
+  if (endPoint && routePointDistance(anchored.at(-1) as RoutePoint, endPoint) > 0.00001) {
+    anchored.push(endPoint)
+  }
+  return anchored
+}
+
+function stagePath(stage: NonNullable<typeof props.day>['stages'][number]): Promise<PlannedRoute> {
+  const start = stagePlaceWithFallback(stage, 'origin').coordinates
+  const end = stagePlaceWithFallback(stage, 'destination').coordinates
+  const persistedPath = stage.route_segments.flatMap((segment) =>
+    segment.coordinates.map((point) => [point.longitude, point.latitude]),
+  )
+  if (persistedPath.length >= 2) {
+    const anchoredPath = anchorRoutePath(persistedPath as RoutePoint[], start, end)
+    return Promise.resolve({
+      path: anchoredPath,
+      mode: (['driving', 'riding', 'walking', 'transit', 'train', 'flight', 'ferry'].includes(stage.mode)
+        ? stage.mode
+        : 'driving') as PlannedRoute['mode'],
+      // A two-point estimated segment is the explicit direct-line fallback;
+      // never ask JSAPI to redraw it and accidentally create another long
+      // cross-city dashed connector.
+      fallback: persistedPath.length === 2 && stage.route_segments.every((segment) => segment.estimated),
+    })
+  }
+  if (!start || !end) return Promise.resolve({ path: [], mode: 'direct', fallback: true })
+  const sameCity = stage.origin.city && stage.origin.city === stage.destination.city
+    ? stage.origin.city
+    : undefined
+  return routeWithFallback(
+    stage.id,
+    start,
+    end,
+    sameCity,
+    stage.waypoints.flatMap((place) => place.coordinates ? [place.coordinates] : []),
+    (['driving', 'riding', 'walking', 'transit'].includes(stage.mode)
+      ? stage.mode
+      : 'driving') as TravelMode,
+  )
+}
+
+type MapPlace = {
+  name: string
+  city?: string
+  coordinates?: { longitude: number; latitude: number }
+}
+
+function stagePlaceWithFallback(
+  stage: NonNullable<typeof props.day>['stages'][number],
+  endpoint: 'origin' | 'destination',
+): MapPlace {
+  const place = stage[endpoint]
+  if (place.coordinates) return place
+  const segments = stage.route_segments ?? []
+  const segment = endpoint === 'origin' ? segments[0] : segments.at(-1)
+  const points = segment?.coordinates ?? []
+  const point = endpoint === 'origin' ? points[0] : points.at(-1)
+  return point ? { ...place, coordinates: point } : place
+}
+
+function activityPlaceWithFallback(
+  activity: NonNullable<typeof props.day>['activities'][number],
+  coordinatesByName: Map<string, { longitude: number; latitude: number }>,
+): MapPlace {
+  if (activity.place.coordinates) return activity.place
+  const fallback = coordinatesByName.get(activity.place.name.trim().toLocaleLowerCase())
+  return fallback ? { ...activity.place, coordinates: fallback } : activity.place
+}
+
+type MarkerCandidate = {
+  place: MapPlace
+  kind: MarkerKind
+  activityIds: string[]
+  stageIds: string[]
+  order: number
+}
+
+type MarkerCluster = {
+  groups: MarkerGroup[]
+}
+
+type MarkerGroup = {
+  place: MapPlace
+  kinds: MarkerKind[]
+  activityIds: string[]
+  stageIds: string[]
+  order: number
+}
+
+function markerKindGroup(kind: MarkerKind): string {
+  if (kind === 'start' || kind === 'end') return 'terminal'
+  return kind
+}
+
+function markerKindPriority(kind: MarkerKind): number {
+  return {
+    start: 0,
+    end: 1,
+    attraction: 2,
+    hotel: 3,
+    meal: 4,
+    charging: 5,
+    fueling: 6,
+    parking: 7,
+    rest: 8,
+    service: 9,
+  }[kind]
+}
+
+function markerDistance(a: MapPlace, b: MapPlace): number {
+  if (!a.coordinates || !b.coordinates) return Number.POSITIVE_INFINITY
+  return Math.hypot(
+    a.coordinates.longitude - b.coordinates.longitude,
+    a.coordinates.latitude - b.coordinates.latitude,
+  )
+}
+
+function normalizedMarkerName(name: string): string {
+  return name
+    .toLocaleLowerCase()
+    .replace(/[（(][^）)]*[）)]/g, '')
+    .replace(/风景名胜区|风景区|景区|地质公园|旅游区/g, '')
+    .replace(/[\s·•\-—_/、，,。:：]/g, '')
+    .trim()
+}
+
+// Provider entrances, hotel pins and nearby service records can drift by a
+// few kilometres even when they describe one named place. Keep one label and
+// expose all category badges instead of rendering a vertical pile of copies.
+const SAME_NAMED_PLACE_DISTANCE = 0.03 // roughly 3 km at mainland-China latitudes
+const SAME_COORDINATE_DISTANCE = 0.001 // roughly 100 m; names may differ by provider
+
+function compatibleMarkerNames(left: string, right: string): boolean {
+  const a = normalizedMarkerName(left)
+  const b = normalizedMarkerName(right)
+  if (!a || !b) return false
+  if (a === b) return true
+  // Providers often decorate one record with a gate, road or district while
+  // another returns the short landmark name. Treat a clear prefix/suffix
+  // relationship as the same place, but require at least three characters so
+  // generic names such as “湖” do not swallow nearby POIs.
+  const shorter = a.length <= b.length ? a : b
+  const longer = a.length <= b.length ? b : a
+  return shorter.length >= 3 && (longer.startsWith(shorter) || longer.endsWith(shorter))
+}
+
+function mergeMarkerCandidates(candidates: MarkerCandidate[]): MarkerCandidate[] {
+  const merged: MarkerCandidate[] = []
+  for (const candidate of candidates) {
+    const existing = merged.find((item) =>
+      markerKindGroup(item.kind) === markerKindGroup(candidate.kind)
+      // A cluster of attraction records often has slightly different names
+      // (for example “锦里” and “武侯祠锦里古街”) but the same map point. Keep
+      // one representative marker for that visual category; other categories
+      // at the same coordinate remain separate and are laid out side by side.
+      && markerDistance(item.place, candidate.place) <= 0.00055,
+    )
+    if (existing) {
+      existing.activityIds.push(...candidate.activityIds)
+      existing.stageIds.push(...candidate.stageIds)
+      existing.order = Math.min(existing.order, candidate.order)
+      if (candidate.place.name.length > existing.place.name.length) {
+        existing.place = candidate.place
+      }
+      if (markerKindPriority(candidate.kind) < markerKindPriority(existing.kind)) {
+        existing.kind = candidate.kind
+      }
+      continue
+    }
+    merged.push({
+      ...candidate,
+      activityIds: [...candidate.activityIds],
+      stageIds: [...candidate.stageIds],
+    })
+  }
+  return merged
+}
+
+function groupMarkerCandidates(candidates: MarkerCandidate[]): MarkerGroup[] {
+  const groups: MarkerGroup[] = []
+  for (const candidate of candidates) {
+    const nameKey = normalizedMarkerName(candidate.place.name)
+    const existing = groups.find((item) =>
+      nameKey
+      && (
+        compatibleMarkerNames(item.place.name, candidate.place.name)
+        || markerDistance(item.place, candidate.place) <= SAME_COORDINATE_DISTANCE
+      )
+      // Route endpoints and activity records for the same named place can
+      // differ by a few hundred metres (or more when a provider geocodes a
+      // district entrance). Keep one shared name with multiple category
+      // badges instead of repeating the name for every record. A very close
+      // coordinate is sufficient even when providers use different labels.
+      && markerDistance(item.place, candidate.place) <= SAME_NAMED_PLACE_DISTANCE,
+    )
+    if (existing) {
+      if (!existing.kinds.includes(candidate.kind)) existing.kinds.push(candidate.kind)
+      existing.activityIds.push(...candidate.activityIds)
+      existing.stageIds.push(...candidate.stageIds)
+      existing.order = Math.min(existing.order, candidate.order)
+      if (candidate.place.name.length > existing.place.name.length) {
+        existing.place = candidate.place
+      }
+      continue
+    }
+    groups.push({
+      place: candidate.place,
+      kinds: [candidate.kind],
+      activityIds: [...candidate.activityIds],
+      stageIds: [...candidate.stageIds],
+      order: candidate.order,
+    })
+  }
+  return groups
+}
+
+function clusterMarkers(groups: MarkerGroup[]): MarkerCluster[] {
+  const clusters: MarkerCluster[] = []
+  for (const group of groups) {
+    const cluster = clusters.find((item) => item.groups.some((other) =>
+      markerDistance(other.place, group.place) <= 0.00085,
+    ))
+    if (cluster) cluster.groups.push(group)
+    else clusters.push({ groups: [group] })
+  }
+  return clusters
+}
+
+function itineraryConnectors(day: NonNullable<typeof props.day>) {
+  const coordinatesByName = new Map<string, { longitude: number; latitude: number }>()
+  for (const stage of day.stages) {
+    for (const endpoint of ['origin', 'destination'] as const) {
+      const place = stagePlaceWithFallback(stage, endpoint)
+      if (place.coordinates) {
+        coordinatesByName.set(place.name.trim().toLocaleLowerCase(), place.coordinates)
+      }
+    }
+  }
+  type TimelinePoint = {
+    kind: 'stage' | 'activity'
+    id: string
+    name: string
+    city?: string
+    coordinates?: { longitude: number; latitude: number }
+    plannedStart: string
+  }
+  const timeline: TimelinePoint[] = [
+    ...day.stages.map((stage) => ({
+      kind: 'stage' as const,
+      id: stage.id,
+      name: stage.destination.name,
+      city: stage.destination.city,
+      coordinates: stagePlaceWithFallback(stage, 'destination').coordinates,
+      plannedStart: stage.planned_start,
+    })),
+    ...day.activities.map((activity) => ({
+      kind: 'activity' as const,
+      id: activity.id,
+      name: activity.place.name,
+      city: activity.place.city,
+      coordinates: activityPlaceWithFallback(activity, coordinatesByName).coordinates,
+      plannedStart: activity.planned_start || '',
+    })),
+  ].sort((left, right) => {
+    const timeDelta = left.plannedStart.localeCompare(right.plannedStart)
+    return timeDelta || (left.kind === 'stage' ? -1 : 1)
+  })
+  const pairs: Array<{
+    id: string
+    start: { longitude: number; latitude: number }
+    end: { longitude: number; latitude: number }
+    city?: string
+    distanceKm: number
+    preferredMode: TravelMode
+  }> = []
+  for (let index = 1; index < timeline.length; index += 1) {
+    const previous = timeline[index - 1]
+    const current = timeline[index]
+    // MovementStage already owns its real road geometry. Connectors are only
+    // needed around activities inserted between stages; this prevents the
+    // old stage-first/activity-last ordering from drawing a false Lushan→Wuhan
+    // dashed line across the whole trip.
+    if (previous.kind === 'stage' && current.kind === 'stage') continue
+    if (!previous.coordinates || !current.coordinates) continue
+    const distance = Math.hypot(
+      previous.coordinates.longitude - current.coordinates.longitude,
+      previous.coordinates.latitude - current.coordinates.latitude,
+    )
+    if (distance <= 0.0001) continue
+    const distanceKm = distance * 92
+    // A connector is only a local transfer between an activity and a stage.
+    // A long gap is a missing stage route, not something to draw as a dashed
+    // straight line across the whole trip.
+    // Keep dashed fallbacks only for a short local transfer. A failed
+    // cross-city lookup must not become a misleading diagonal across the
+    // whole map; the corresponding stage card still explains that routing
+    // data is unavailable.
+    if (distanceKm > 12) continue
+    const id = `connector-${previous.id}-${current.id}`
+    if (pairs.some((item) => item.id === id)) continue
+    pairs.push({
+      id,
+      start: previous.coordinates,
+      end: current.coordinates,
+      city: previous.city === current.city ? current.city : undefined,
+      distanceKm,
+      // A connector around an activity is a local transfer. Prefer walking
+      // first; routeWithFallback still tries riding/transit/driving when the
+      // map provider cannot return a pedestrian path.
+      preferredMode: previous.kind === 'activity' || current.kind === 'activity'
+        ? 'walking'
+        : 'driving',
+    })
+  }
+  return pairs
+}
+
+function stageContinuityConnectors(day: NonNullable<typeof props.day>) {
+  type StageConnector = {
+    id: string
+    start: { longitude: number; latitude: number }
+    end: { longitude: number; latitude: number }
+    city?: string
+    distanceKm: number
+    preferredMode: TravelMode
+  }
+  const pairs: StageConnector[] = []
+  const stages = [...day.stages].sort((left, right) =>
+    left.planned_start.localeCompare(right.planned_start)
+    || left.sequence - right.sequence,
+  )
+  for (let index = 1; index < stages.length; index += 1) {
+    const previous = stagePlaceWithFallback(stages[index - 1], 'destination')
+    const current = stagePlaceWithFallback(stages[index], 'origin')
+    if (!previous.coordinates || !current.coordinates) continue
+    const distance = Math.hypot(
+      previous.coordinates.longitude - current.coordinates.longitude,
+      previous.coordinates.latitude - current.coordinates.latitude,
+    )
+    const distanceKm = distance * 92
+    // The backend accepts a few kilometres of geocoding drift as the same
+    // place. Draw that short link on the map as well, otherwise two valid
+    // cards can look visually disconnected even though the verifier passes.
+    if (distanceKm <= 0.05 || distanceKm > 3) continue
+    const id = `stage-continuity-${stages[index - 1].id}-${stages[index].id}`
+    if (pairs.some((item) => item.id === id)) continue
+    pairs.push({
+      id,
+      start: previous.coordinates,
+      end: current.coordinates,
+      city: previous.city === current.city ? current.city : undefined,
+      distanceKm,
+      preferredMode: stages[index - 1].mode === 'driving' || stages[index].mode === 'driving'
+        ? 'driving'
+        : stages[index - 1].mode === 'riding'
+          ? 'riding'
+          : stages[index - 1].mode === 'walking'
+            ? 'walking'
+            : 'transit',
+    })
+  }
+  return pairs
+}
+
+let renderVersion = 0
+function clearRenderedOverlays() {
+  if (!map.value) return
+  map.value.remove([
+    ...routeOverlays.value.map((item) => item.polyline),
+    ...otherOverlays.value,
+  ])
+  routeOverlays.value = []
+  otherOverlays.value = []
+}
+
+async function renderRoutes() {
+  if (!map.value || !AMap.value || !props.day) return
+  const version = ++renderVersion
+  // Snapshot the selected day for the whole asynchronous render. Route
+  // lookups can take several seconds; reading props.day again after an await
+  // used to combine the previous day's paths with the newly selected day's
+  // markers. Clear the old overlays immediately so the map never advertises a
+  // different day while the new routes are being fetched.
+  const day = props.day
+  const dayId = day.id
+  clearRenderedOverlays()
+  routeLoading.value = true
+  const plannedPaths = await Promise.all(
+    day.stages.map(async (stage) => ({ stage, route: await stagePath(stage) })),
+  )
+  const connectorPlans = [
+    ...itineraryConnectors(day),
+    ...stageContinuityConnectors(day),
+  ]
+  const plannedConnectors = await Promise.all(
+    connectorPlans.map(async (connector) => ({
+      connector,
+      route: await routeWithFallback(
+        connector.id,
+        connector.start,
+        connector.end,
+        connector.city,
+        [],
+        connector.preferredMode,
+      ),
+    })),
+  )
+  if (version !== renderVersion || !map.value || props.day?.id !== dayId) {
+    if (version === renderVersion) routeLoading.value = false
+    return
+  }
+  routeUnavailable.value = [...plannedPaths, ...plannedConnectors].some(({ route }) => route.mode === 'direct')
+
+  const modeColor: Record<PlannedRoute['mode'], string> = {
+    driving: '#1677ff',
+    riding: '#f2a51a',
+    walking: '#f2a51a',
+    transit: '#18a66a',
+    train: '#18a66a',
+    flight: '#7c5ce8',
+    ferry: '#13a9c7',
+    direct: '#9aa5b4',
+  }
+  const inactiveRouteColor = '#98a3b2'
+  for (const { stage, route } of plannedPaths) {
+    const unavailable = route.mode === 'direct'
+    const start = stagePlaceWithFallback(stage, 'origin').coordinates
+    const end = stagePlaceWithFallback(stage, 'destination').coordinates
+    // Keep an estimated dashed line even for a long leg when the online route
+    // service is unavailable. Hiding it made the itinerary look disconnected;
+    // the badge and dashed style make the uncertainty explicit without
+    // pretending that a direct line is turn-by-turn navigation.
+    const displayPath = unavailable && start && end && route.path.length < 2
+      ? [[start.longitude, start.latitude], [end.longitude, end.latitude]]
+      : route.path
+    if (displayPath.length < 2) continue
+    const active = stage.id === props.activeStageId
+    const polyline = new AMap.value.Polyline({
+      path: displayPath,
+      isOutline: active && !unavailable,
+      outlineColor: '#dbe9ff',
+      borderWeight: 3,
+      strokeColor: active && !unavailable ? modeColor[route.mode] : inactiveRouteColor,
+      strokeOpacity: active ? 0.96 : 0.78,
+      strokeWeight: active && !unavailable ? 4 : 2.5,
+      strokeStyle: unavailable ? 'dashed' : 'solid',
+      strokeDasharray: unavailable ? [8, 8] : undefined,
+      lineJoin: 'round',
+      lineCap: 'round',
+      showDir: active && !unavailable,
+      zIndex: active ? 80 : 50,
+      extData: { stageId: stage.id, unavailable, mode: route.mode },
+    })
+    polyline.on('click', () => emit('selectStage', stage.id))
+    routeOverlays.value.push({ stageId: stage.id, polyline })
+  }
+
+  for (const { connector, route } of plannedConnectors) {
+    if (route.path.length < 2) continue
+    const unavailable = route.mode === 'direct'
+    const polyline = new AMap.value.Polyline({
+      path: route.path,
+      strokeColor: inactiveRouteColor,
+      strokeOpacity: unavailable ? 0.72 : 0.78,
+      strokeWeight: 2.5,
+      strokeStyle: unavailable ? 'dashed' : 'solid',
+      strokeDasharray: unavailable ? [8, 8] : undefined,
+      lineJoin: 'round',
+      lineCap: 'round',
+      showDir: false,
+      zIndex: 45,
+      extData: { connectorId: connector.id, unavailable, mode: route.mode },
+    })
+    routeOverlays.value.push({ stageId: connector.id, polyline })
+  }
+
+  const coordinatesByName = new Map<string, { longitude: number; latitude: number }>()
+  for (const stage of day.stages) {
+    for (const endpoint of ['origin', 'destination'] as const) {
+      const place = stagePlaceWithFallback(stage, endpoint)
+      if (place.coordinates) {
+        coordinatesByName.set(place.name.trim().toLocaleLowerCase(), place.coordinates)
+      }
+    }
+  }
+  const markerCandidates: MarkerCandidate[] = []
+  let markerOrder = 0
+  const firstStage = day.stages[0]
+  const lastStage = day.stages.at(-1)
+  for (const stage of day.stages) {
+    const origin = stagePlaceWithFallback(stage, 'origin')
+    if (origin.coordinates) {
+      markerCandidates.push({
+        place: origin,
+        kind: stage === firstStage ? 'start' : 'service',
+        activityIds: [],
+        stageIds: [stage.id],
+        order: markerOrder++,
+      })
+    }
+  }
+  for (const stage of day.stages) {
+    const destination = stagePlaceWithFallback(stage, 'destination')
+    if (destination.coordinates) {
+      markerCandidates.push({
+        place: destination,
+        kind: stage === lastStage ? 'end' : 'attraction',
+        activityIds: [],
+        stageIds: [stage.id],
+        order: markerOrder++,
+      })
+    }
+  }
+  for (const activity of day.activities) {
+    const place = activityPlaceWithFallback(activity, coordinatesByName)
+    if (place.coordinates) {
+      markerCandidates.push({
+        place,
+        kind: activityMarkerKind(activity.type),
+        activityIds: [activity.id],
+        stageIds: [],
+        order: markerOrder++,
+      })
+    }
+  }
+  const mergedMarkers = mergeMarkerCandidates(markerCandidates)
+    .sort((left, right) =>
+      markerKindPriority(left.kind) - markerKindPriority(right.kind)
+      || left.order - right.order,
+    )
+  const markerGroups = groupMarkerCandidates(mergedMarkers)
+    .sort((left, right) =>
+      Math.min(...left.kinds.map(markerKindPriority)) - Math.min(...right.kinds.map(markerKindPriority))
+      || left.order - right.order,
+    )
+  const markerClusters = clusterMarkers(markerGroups)
+  let markerIndex = 0
+  for (const cluster of markerClusters) {
+    const groups = [...cluster.groups].sort((left, right) =>
+      Math.min(...left.kinds.map(markerKindPriority)) - Math.min(...right.kinds.map(markerKindPriority))
+      || left.order - right.order,
+    )
+    const columns = Math.min(5, groups.length)
+    for (const [slot, group] of groups.entries()) {
+      const place = group.place
+      if (!place.coordinates) continue
+      const kinds = [...group.kinds].sort((left, right) => markerKindPriority(left) - markerKindPriority(right))
+      const primaryKind = kinds[0] ?? 'service'
+      const terminal = kinds.some((kind) => kind === 'start' || kind === 'end')
+      const row = Math.floor(slot / columns)
+      const column = slot % columns
+      const xOffset = (column - (columns - 1) / 2) * 180
+      const yOffset = -38 - row * 48
+      const badges = kinds
+        .map((kind) => `<b class="amap-marker-badge amap-marker-${kind}">${markerIcon(kind)}</b>`)
+        .join('')
+      const marker = new AMap.value.Marker({
+        position: [place.coordinates.longitude, place.coordinates.latitude],
+        title: place.name,
+        content: `<div class="${terminal ? 'amap-terminal-marker' : 'amap-poi-marker'} amap-marker-group amap-marker-${primaryKind}"><div class="amap-marker-badges">${badges}</div><span>${escapeHtml(place.name)}</span></div>`,
+        // One named place owns one label. Its attraction/meal/hotel/service
+        // categories are shown as a compact badge row; different named places
+        // in the same map cluster are still laid out horizontally.
+        offset: new AMap.value.Pixel(-16 + xOffset, yOffset),
+        zIndex: 1000 + markerIndex++,
+      })
+      const activityId = group.activityIds[0]
+      if (activityId) marker.on('click', () => emit('selectActivity', activityId))
+      otherOverlays.value.push(marker)
+    }
+  }
+
+  const overlays = [
+    ...routeOverlays.value.map((item) => item.polyline),
+    ...otherOverlays.value,
+  ]
+  map.value.add(overlays)
+  const activeRoute = routeOverlays.value.find((item) => item.stageId === props.activeStageId)?.polyline
+  if (activeRoute) {
+    const [fitZoom, fitCenter] = map.value.getFitZoomAndCenterByOverlays(
+      [activeRoute],
+      [80, 80, 80, 80],
+      16,
+    )
+    map.value.setZoomAndCenter(Math.max(3, fitZoom - 0.2), fitCenter, false, 2400)
+  } else if (overlays.length) {
+    const [fitZoom, fitCenter] = map.value.getFitZoomAndCenterByOverlays(
+      overlays,
+      [80, 80, 80, 80],
+      9,
+    )
+    map.value.setZoomAndCenter(fitZoom, fitCenter, false, 1000)
+  }
+  routeLoading.value = false
+}
+
+async function initMap() {
+  if (!hasCredentials.value) {
+    loading.value = false
+    failed.value = true
+    return
+  }
+  try {
+    window._AMapSecurityConfig = serviceHost
+      ? { serviceHost }
+      : { securityJsCode: securityCode }
+    const instance = await AMapLoader.load({
+      key: amapKey,
+      version: '2.0',
+      plugins: [
+        'AMap.Scale',
+        'AMap.ToolBar',
+        'AMap.Driving',
+        'AMap.Riding',
+        'AMap.Walking',
+        'AMap.Transfer',
+        'AMap.Geocoder',
+      ],
+    })
+    if (typeof instance.getConfig === 'function') {
+      instance.getConfig().appname = 'rovia-amap-jsapi'
+    }
+    AMap.value = instance
+    await nextTick()
+    map.value = new instance.Map(containerId, {
+      viewMode: '3D',
+      zoom: 8,
+      center: [115.22, 30.04],
+      pitch: 16,
+      mapStyle: 'amap://styles/whitesmoke',
+      dragEnable: true,
+      zoomEnable: true,
+      scrollWheel: true,
+      doubleClickZoom: true,
+    })
+    map.value.addControl(new instance.Scale())
+    map.value.addControl(new instance.ToolBar({ position: { right: '12px', top: '12px' } }))
+    const geocoder = new instance.Geocoder({ radius: 800, extensions: 'all' })
+    map.value.on('click', (event: any) => {
+      if (!props.pickEnabled) return
+      const longitude = Number(event.lnglat.getLng())
+      const latitude = Number(event.lnglat.getLat())
+      if (pickedMarker.value) map.value.remove(pickedMarker.value)
+      pickedMarker.value = new instance.Marker({
+        position: [longitude, latitude],
+        content: '<div class="amap-picked-marker"><span>+</span></div>',
+        offset: new instance.Pixel(-18, -36),
+        zIndex: 3000,
+      })
+      map.value.add(pickedMarker.value)
+      geocoder.getAddress([longitude, latitude], (status: string, result: any) => {
+        const regeocode = status === 'complete' ? result?.regeocode : undefined
+        const poiName = regeocode?.pois?.[0]?.name
+        const address = regeocode?.formattedAddress
+        emit('pointSelected', {
+          name: poiName || address || `地图选点 ${longitude.toFixed(5)},${latitude.toFixed(5)}`,
+          address,
+          longitude,
+          latitude,
+        })
+      })
+    })
+    map.value.on('complete', () => {
+      loading.value = false
+      void renderRoutes()
+    })
+  } catch (error) {
+    console.warn(
+      'Rovia 高德地图初始化失败：',
+      error instanceof Error ? error.message : '未知错误',
+    )
+    loading.value = false
+    failed.value = true
+  }
+}
+
+watch(
+  () => [props.day?.id, props.activeStageId],
+  () => void renderRoutes(),
+)
+const mapDataSignature = computed(() => {
+  const day = props.day
+  if (!day) return ''
+  const placeSignature = (place: MapPlace) => {
+    const coordinates = place.coordinates
+    return `${place.name}:${coordinates?.longitude ?? ''},${coordinates?.latitude ?? ''}`
+  }
+  return [
+    day.id,
+    ...day.stages.map((stage) => [
+      stage.id,
+      stage.mode,
+      stage.planned_start,
+      stage.planned_end,
+      placeSignature(stage.origin),
+      placeSignature(stage.destination),
+      stage.route_segments.map((segment) => segment.coordinates.length).join(','),
+      stage.route_segments.map((segment) => segment.coordinates.map((point) =>
+        `${point.longitude},${point.latitude}`).join(';')).join('|'),
+    ].join('|')),
+    ...day.activities.map((activity) => [
+      activity.id,
+      activity.type,
+      activity.planned_start,
+      activity.planned_end,
+      placeSignature(activity.place),
+    ].join('|')),
+  ].join('::')
+})
+watch(mapDataSignature, () => void renderRoutes())
+watch(() => props.pickEnabled, (enabled) => {
+  if (!enabled && pickedMarker.value && map.value) {
+    map.value.remove(pickedMarker.value)
+    pickedMarker.value = null
+  }
+})
+onMounted(initMap)
+onBeforeUnmount(() => {
+  map.value?.destroy()
+  map.value = null
+  AMap.value = null
+})
+</script>
+
+<template>
+  <div class="amap-shell" :class="{ 'is-picking': pickEnabled }">
+    <div v-show="!failed" :id="containerId" class="amap-container" />
+    <MockRouteMap v-if="failed" :day="day" :active-stage-id="activeStageId" />
+    <div v-if="loading" class="map-loading"><i />正在加载在线地图…</div>
+    <div v-if="failed" class="map-fallback-badge">在线地图暂不可用 · 已切换示例底图</div>
+    <div v-else-if="!loading" class="map-live-badge" :class="{ warning: routeUnavailable }">
+      {{ routeLoading ? '真实道路点列计算中…' : routeUnavailable ? '部分路段未返回道路点列 · 仅局部虚线直连' : '真实道路轨迹' }}
+    </div>
+  </div>
+</template>

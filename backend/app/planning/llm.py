@@ -1,0 +1,2562 @@
+import json
+import re
+from contextvars import ContextVar, Token
+from time import monotonic
+from datetime import date, timedelta
+from typing import Any
+
+import httpx
+
+from ..core.config import Settings
+
+
+_current_user_id: ContextVar[str | None] = ContextVar(
+    "rovia_current_user_id",
+    default=None,
+)
+
+
+def set_current_user_id(user_id: str | None) -> Token[str | None]:
+    return _current_user_id.set(user_id)
+
+
+def reset_current_user_id(token: Token[str | None]) -> None:
+    _current_user_id.reset(token)
+
+
+def _llm_config(settings: Settings) -> tuple[str, str, str, str, float, bool, int]:
+    """Return one provider-neutral connection tuple.
+
+    The planner never chooses an endpoint or model per agent.  Values come
+    from the canonical ``LLM_*`` settings and fall back to legacy names only
+    to keep older deployments bootable.  ``api_style`` controls the request
+    body shape: ``openai`` for Chat Completions or ``ollama_generate`` for the
+    native Ollama endpoint.
+    """
+    api_key = str(
+        getattr(settings, "llm_api_key", "")
+        or getattr(settings, "ollama_api_key", "")
+        or getattr(settings, "deepseek_api_key", "")
+        or ""
+    ).strip()
+    api_url = str(
+        getattr(settings, "llm_api_url", "")
+        or getattr(settings, "ollama_api_url", "")
+        or ""
+    ).strip()
+    model = str(
+        getattr(settings, "llm_model", "")
+        or getattr(settings, "ollama_model", "")
+        or getattr(settings, "deepseek_model", "")
+        or ""
+    ).strip()
+    api_style = str(getattr(settings, "llm_api_style", "openai") or "openai").strip().lower()
+    if api_style not in {"openai", "ollama_generate"}:
+        api_style = "openai"
+    timeout = float(
+        getattr(settings, "llm_timeout_seconds", 0)
+        or getattr(settings, "ollama_timeout_seconds", 0)
+        or getattr(settings, "deepseek_timeout_seconds", 0)
+        or 90
+    )
+    if timeout <= 0:
+        timeout = 90
+    thinking_value = getattr(settings, "llm_thinking", None)
+    if thinking_value is None:
+        thinking_value = getattr(settings, "ollama_thinking", False) or getattr(
+            settings, "deepseek_thinking", False
+        )
+    thinking = bool(thinking_value)
+    max_tokens = int(
+        getattr(settings, "llm_max_tokens", 0)
+        or getattr(settings, "ollama_max_tokens", 0)
+        or getattr(settings, "deepseek_max_tokens", 0)
+        or 32768
+    )
+    return api_key, api_url, model, api_style, timeout, thinking, max(256, max_tokens)
+
+
+def llm_is_configured(settings: Settings) -> bool:
+    """Whether a usable semantic-provider credential is available."""
+    api_key, api_url, model, *_ = _llm_config(settings)
+    return bool(api_key and api_url and model)
+
+
+def llm_timeout_seconds(settings: Settings) -> float:
+    """Return the configured timeout without exposing provider aliases."""
+    return _llm_config(settings)[4]
+
+
+def llm_config_summary(settings: Settings) -> dict[str, Any]:
+    """Return safe runtime diagnostics (never the API key or request body)."""
+    api_key, api_url, model, api_style, timeout, thinking, max_tokens = _llm_config(settings)
+    return {
+        "provider": str(getattr(settings, "llm_provider", "configured") or "configured"),
+        "api_style": api_style,
+        "api_url": api_url.split("?", 1)[0],
+        "model": model,
+        "key_configured": bool(api_key),
+        "thinking": thinking,
+        "max_tokens": max_tokens,
+        "timeout_seconds": timeout,
+    }
+
+
+# Compatibility for integrations that imported the old tuple helper.  The
+# tuple now describes the configured provider, not a hard-coded vendor.
+def _ollama_config(settings: Settings) -> tuple[str, str, str, float, bool, int]:
+    api_key, api_url, model, _style, timeout, thinking, max_tokens = _llm_config(settings)
+    return api_key, api_url, model, timeout, thinking, max_tokens
+
+
+def _deepseek_config(settings: Settings) -> tuple[str, str, str, float, bool, int, str]:
+    api_key, api_url, model, _style, timeout, thinking, max_tokens = _llm_config(settings)
+    return api_key, api_url, model, timeout, thinking, max_tokens, "off"
+
+
+def _content_from_response(body: Any) -> str | None:
+    """Extract visible text from OpenAI-shaped or native response bodies."""
+    if not isinstance(body, dict):
+        return None
+    content: Any = body.get("response")
+    if content is None:
+        choices = body.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            message = choices[0].get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+            if content is None:
+                content = choices[0].get("text")
+    if isinstance(content, list):
+        # OpenAI multimodal-compatible proxies may return content parts.
+        content = "".join(
+            str(part.get("text") or part.get("content") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+    return content.strip() if isinstance(content, str) and content.strip() else None
+
+
+async def llm_complete(
+    settings: Settings,
+    prompt: str,
+    *,
+    timeout: float | None = None,
+    json_output: bool = True,
+    agent_name: str = "semantic_agent",
+) -> str:
+    """Call the configured semantic provider and return visible content.
+
+    Every agent uses this function.  With ``LLM_API_STYLE=openai`` the request
+    and response follow the OpenAI Chat Completions contract regardless of the
+    configured provider name.  Native Ollama remains available only when the
+    external configuration explicitly selects ``ollama_generate``.
+    """
+    api_key, api_url, model, api_style, configured_timeout, thinking, max_tokens = _llm_config(
+        settings
+    )
+    if not api_key:
+        raise ValueError("LLM_API_KEY is not configured")
+    if not api_url:
+        raise ValueError("LLM_API_URL is not configured")
+    if not model:
+        raise ValueError("LLM_MODEL is not configured")
+    if api_style == "ollama_generate":
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "think": thinking,
+            "options": {"num_predict": max_tokens, "temperature": 0},
+        }
+        if json_output:
+            payload["format"] = "json"
+    else:
+        payload = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        }
+        if json_output:
+            payload["response_format"] = {"type": "json_object"}
+    request_timeout = float(timeout if timeout is not None else configured_timeout)
+    started_at = monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
+            response = await client.post(
+                api_url,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            body = response.json()
+    except Exception as error:
+        await _audit_deepseek_call(
+            agent_name,
+            success=False,
+            latency_ms=round((monotonic() - started_at) * 1000),
+            error_code=type(error).__name__.upper(),
+            provider=str(getattr(settings, "llm_provider", "configured") or "configured"),
+        )
+        raise
+    content = _content_from_response(body)
+    if not isinstance(content, str) or not content.strip():
+        await _audit_deepseek_call(
+            agent_name,
+            success=False,
+            latency_ms=round((monotonic() - started_at) * 1000),
+            error_code="EMPTY_AGENT_RESPONSE",
+            usage=body.get("usage") if isinstance(body, dict) else None,
+            provider=str(getattr(settings, "llm_provider", "configured") or "configured"),
+        )
+        raise ValueError("LLM response did not contain assistant content")
+    await _audit_deepseek_call(
+        agent_name,
+        success=True,
+        latency_ms=round((monotonic() - started_at) * 1000),
+        usage=body.get("usage") if isinstance(body, dict) else None,
+        provider=str(getattr(settings, "llm_provider", "configured") or "configured"),
+    )
+    return content
+
+
+# Compatibility name for callers that explicitly requested the previous
+# Ollama helper.  It now follows the same provider-neutral configuration.
+async def ollama_complete(
+    settings: Settings,
+    prompt: str,
+    *,
+    timeout: float | None = None,
+    json_output: bool = True,
+    agent_name: str = "semantic_agent",
+) -> str:
+    return await llm_complete(
+        settings,
+        prompt,
+        timeout=timeout,
+        json_output=json_output,
+        agent_name=agent_name,
+    )
+
+
+# Compatibility for integrations and tests that still import the old helper.
+# It delegates to the provider-neutral adapter; the configured endpoint is
+# the only source of transport/provider behavior.
+async def deepseek_complete(
+    settings: Settings,
+    prompt: str,
+    *,
+    timeout: float | None = None,
+    json_output: bool = True,
+    agent_name: str = "semantic_agent",
+) -> str:
+    return await llm_complete(
+        settings,
+        prompt,
+        timeout=timeout,
+        json_output=json_output,
+        agent_name=agent_name,
+    )
+
+
+async def _audit_llm_call(
+    agent_name: str,
+    *,
+    provider: str,
+    success: bool,
+    latency_ms: int,
+    usage: dict[str, Any] | None = None,
+    error_code: str | None = None,
+) -> None:
+    from ..repositories.skill_calls import record_agent_call
+
+    await record_agent_call(
+        f"agent.{agent_name}",
+        user_id=_current_user_id.get(),
+        provider=provider,
+        success=success,
+        latency_ms=latency_ms,
+        usage=usage,
+        error_code=error_code,
+    )
+
+
+# Keep the old audit hook patchable for existing tests/integrations while the
+# persisted provider is now the configured provider label.
+async def _audit_deepseek_call(
+    agent_name: str,
+    *,
+    provider: str = "configured",
+    success: bool,
+    latency_ms: int,
+    usage: dict[str, Any] | None = None,
+    error_code: str | None = None,
+) -> None:
+    await _audit_llm_call(
+        agent_name,
+        provider=provider,
+        success=success,
+        latency_ms=latency_ms,
+        usage=usage,
+        error_code=error_code,
+    )
+
+
+class RequirementExtractionAgent:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def extract(self, raw_text: str, today: date) -> dict[str, Any]:
+        # Semantic intent is owned by the Requirement Agent.  The deterministic
+        # parser is used only for calendar literals/relative calendar structure;
+        # it must never guess an origin, destination, POI, party size or travel
+        # mode.  In particular, an unavailable Agent must not turn “新疆” into
+        # whichever restaurant/campus happens to be returned by a nearby search.
+        structural = extract_structural_constraints(raw_text, today)
+        if (
+            not self.settings.enable_llm_requirement_extraction
+            or not llm_is_configured(self.settings)
+        ):
+            return {
+                **structural,
+                "_intent_status": "unavailable",
+                "_intent_error": "REQUIREMENT_AGENT_UNAVAILABLE",
+            }
+        prompt = (
+            "You are Rovia Requirement Agent. Extract requirements only; never plan a route. "
+            f"Today is {today.isoformat()}. Return ONLY one valid JSON object (no markdown, no explanation) "
+            "with exactly these keys: origin_name, destination_name, destination_names, destination_scope, "
+            "travel_intents, start_date, end_date, "
+            "departure_time, return_time, departure_period, travelers, max_days, preferences, transport_modes, special_events, "
+            "cross_sea_required, cross_sea_mode, past_return_requested, time_window_minutes, stay_only_at_destination, must_visit_names. "
+            "Dates must be YYYY-MM-DD; unknown scalar fields must be null and all list fields must be arrays. "
+            "destination_name is one canonical route anchor string or null; destination_names is the complete ordered "
+            "list of places explicitly requested by the user. Never stringify a list into destination_name. "
+            "destination_scope must be exactly one of poi, city, province, region, multi_destination, unknown. "
+            "For a province/region/city, keep the administrative name itself; never replace it with a nearby hotel, "
+            "restaurant, university, campus or other POI. If the same destination phrase contains an administrative "
+            "parent and a more specific child city/area (for example ‘河南郑州附近’), the child is the canonical "
+            "route anchor: return destination_name=郑州, destination_scope=city and do not treat 河南 as a second "
+            "stop. ‘附近/周边/及其周边’ is a scope modifier, not another destination. Only keep the parent in "
+            "destination_names when the user explicitly intends multiple separate stops. For multiple regions/cities, "
+            "preserve every destination in destination_names and use the first explicitly ordered region as "
+            "destination_name only when a route anchor is needed. travel_intents contains the user's actual experience goals (for example stargazing or food), "
+            "not guessed place names. "
+            "Only fill start_date/end_date when the user's text explicitly gives a calendar date, a relative date "
+            "such as 今天/明天/后天/前天, or an unambiguous weekday. English relative dates and weekdays "
+            "(today, tomorrow, the day after tomorrow, Monday, next Sunday/next week Sunday, this weekend) must also be "
+            "resolved against Today. Phrases such as 今年暑假、最多三天、玩三天 are not "
+            "calendar dates; leave both date fields null instead of inventing dates. "
+            "A named Chinese holiday is a concrete calendar anchor: 国庆节 means October 1 (National Day), "
+            "劳动节 means May 1, 元旦 means January 1. When the user says 国庆节假期 or 国庆假期, resolve the "
+            "official holiday window (October 1 through October 7) as start_date/end_date; do not ask for a date "
+            "that the holiday already determines. Lunar holidays such as 春节/中秋/端午/清明 must be resolved "
+            "from the lunar calendar for the current year; do not ask the user for their dates. "
+            "A duration bound such as 最多五天/玩三天/5 days is not a date pair by itself, but when combined "
+            "with a weekend or holiday it widens the window: 下个月找个周末去杭州，最多五天 means a Saturday "
+            "start with an end date five days later (Saturday through Wednesday), not a two-day weekend. "
+            "When the user names a weekend (周末/this weekend/next weekend) without a second weekday, "
+            "start_date is the Saturday and end_date is the Sunday unless a duration bound widens it. "
+            "Always preserve the duration the user actually requested in max_days even when it is unusually long "
+            "(for example 277天 must return max_days=277). Do not clamp it or silently discard it; a later policy "
+            "guard decides whether the product supports that duration. "
+            "Normalize Chinese time phrases: 中午=12:00, 下午=14:00, 晚上=19:00. "
+            "Understand relative weekdays and ranges as a pair: 周一出发、周五回来 means a Monday-to-Friday "
+            "window in the same upcoming week; 周末 means Saturday through Sunday; do not return an end date "
+            "earlier than the start date. "
+            "When a weekday pair is present, resolve both concrete dates from Today instead of leaving one null. "
+            "Infer travelers semantically (情侣/夫妻=2, 一家三口=3); do not default to 1 when evidence is absent. "
+            "请根据语义判断同行人数，不要机械默认 1。"
+            "transport_modes must be an array containing only explicitly preferred or explicitly allowed modes from "
+            "driving, train, flight, ferry, transit, walking, riding.  Interpret 高铁/动车/火车 as train, "
+            "飞机/航班 as flight, 轮船/渡轮/船 as ferry, "
+            "自驾/开车 as driving, and 公交/地铁/公共交通 as transit.  ‘可以坐高铁’ means train is an allowed and "
+            "preferred intercity option; do not silently force driving for a long-distance trip.  If no transport "
+            "preference is stated, return an empty array; the planner will then use driving for both intercity and local movement. "
+            "cross_sea_required must be true only when the trip actually requires crossing a sea or water barrier; "
+            "cross_sea_mode may be ferry, flight, bridge or null. past_return_requested is true only when the user "
+            "explicitly requests returning before the current date. time_window_minutes is the user's explicit "
+            "departure-to-arrival window, or null when no such window is stated. "
+            "stay_only_at_destination is true only when the user explicitly says to stay all days in one destination or not visit other places; must_visit_names contains explicitly required named places. "
+            "For text like 从A出发，在B及其周边旅游, use A as origin and B as destination. "
+            "Separate the destination from the experience: in 到九宫山看流星雨, destination_name is 九宫山, "
+            "special_events contains 流星雨. For astronomy, festivals, flowers or seasonal events, preserve the "
+            "event name and ask a later research step to verify date, peak time, cloud/moon conditions and visibility. "
+            "User text: "
+            + raw_text
+        )
+        try:
+            response_text = await deepseek_complete(
+                self.settings,
+                prompt,
+                timeout=llm_timeout_seconds(self.settings),
+                agent_name="requirement_extractor",
+            )
+            parsed = _parse_json_object(response_text)
+            if _destination_payload_needs_repair(parsed):
+                parsed = await self._repair_destination_payload(
+                    raw_text,
+                    parsed,
+                )
+            # A successful semantic response can still omit one of the route
+            # anchors (for example it may return destination=三亚 but leave
+            # origin empty).  Do not infer the missing value with a keyword
+            # table or a nearby geocoder result.  Give the same Requirement
+            # Agent one focused repair turn and merge only fields that were
+            # actually missing from the first response.  If the repair call
+            # is unavailable, the original response remains intact and the
+            # normal clarification flow is allowed to ask the user plainly.
+            parsed, semantic_repair_used = await self._repair_missing_core_fields(
+                raw_text,
+                parsed,
+            )
+            parsed, destination_adjudication_used = await self._adjudicate_destination_anchor(
+                raw_text,
+                parsed,
+            )
+            merged = _merge_extraction(structural, parsed)
+            if isinstance(parsed, dict):
+                # Literal calendar tokens are hard user constraints. Do not
+                # let the Agent hallucinate another year.  Dates inferred from
+                # a weekend/month/holiday phrase are drafts and must not
+                # override a semantic Agent answer.
+                draft_date_fields = set(structural.get("_inferred_date_fields") or [])
+                for date_field in ("start_date", "end_date"):
+                    if (
+                        structural.get(date_field)
+                        and date_field not in draft_date_fields
+                    ):
+                        merged[date_field] = structural[date_field]
+                # Explicit clock windows are hard constraints just like
+                # literal calendar dates.  Do not let a partial/cloud Agent
+                # response erase an impossible same-leg window.
+                for clock_field in (
+                    "departure_time",
+                    "return_time",
+                    "time_window_minutes",
+                ):
+                    if structural.get(clock_field) is not None:
+                        merged[clock_field] = structural[clock_field]
+                if structural.get("cross_sea_required") is True:
+                    merged["cross_sea_required"] = True
+                # The cloud Agent must not invent a ferry/flight choice just
+                # because a trip crosses water. Keep a mode only when the
+                # user explicitly wrote one; otherwise preflight asks.
+                merged["cross_sea_mode"] = structural.get("cross_sea_mode")
+                if not merged.get("start_date"):
+                    merged.pop("end_date", None)
+                destination_name = merged.get("destination_name")
+                if destination_name is not None:
+                    if not isinstance(destination_name, str) or _looks_like_serialized_list(destination_name):
+                        return {
+                            **structural,
+                            "_intent_status": "invalid",
+                            "_intent_error": "INVALID_DESTINATION_SHAPE",
+                        }
+                    normalized_destination = _normalize_place_name(destination_name)
+                    if normalized_destination:
+                        merged["destination_name"] = normalized_destination
+                    else:
+                        merged.pop("destination_name", None)
+                merged["destination_names"] = _normalize_destination_names(
+                    merged.get("destination_names")
+                )
+                if not merged.get("destination_name") and len(merged["destination_names"]) == 1:
+                    # This is not a place-name inference: the Agent already
+                    # returned the typed destination_names array.  A single
+                    # entry has an unambiguous route anchor.
+                    merged["destination_name"] = merged["destination_names"][0]
+                scope = str(merged.get("destination_scope") or "unknown").strip().lower()
+                merged["destination_scope"] = (
+                    scope
+                    if scope in {"poi", "city", "province", "region", "multi_destination", "unknown"}
+                    else "unknown"
+                )
+                merged["travel_intents"] = _normalize_text_list(
+                    merged.get("travel_intents"), maximum=20
+                )
+                merged["preferences"] = _normalize_text_list(
+                    merged.get("preferences"), maximum=40
+                )
+                merged["special_events"] = _normalize_special_events(merged.get("special_events"))
+                merged["must_visit_names"] = [
+                    str(item).strip() for item in (merged.get("must_visit_names") or [])
+                    if str(item).strip()
+                ][:40]
+                merged["stay_only_at_destination"] = bool(merged.get("stay_only_at_destination"))
+                for clock_field in ("departure_time", "return_time"):
+                    normalized_clock = _normalize_clock(merged.get(clock_field))
+                    if normalized_clock:
+                        merged[clock_field] = normalized_clock
+                    else:
+                        merged.pop(clock_field, None)
+                departure_period = str(merged.get("departure_period") or "").strip().lower()
+                if departure_period in {"morning", "afternoon", "evening"}:
+                    merged["departure_period"] = departure_period
+                else:
+                    merged.pop("departure_period", None)
+                # Party size is a semantic decision owned by the Requirement
+                # Agent (for example, “情侣” means two people). The backend
+                # only validates the returned scalar and never scans raw text.
+                merged["travelers"] = _coerce_travelers(merged.get("travelers"))
+                if merged.get("travelers") is None:
+                    merged.pop("travelers", None)
+                merged["transport_modes"] = _normalize_transport_modes(
+                    merged.get("transport_modes")
+                )
+                max_days = _coerce_positive_int(merged.get("max_days"), maximum=3650)
+                if max_days is None:
+                    merged.pop("max_days", None)
+                else:
+                    merged["max_days"] = max_days
+                    # “下周一出发，十天左右” supplies a duration rather than
+                    # a second calendar literal. Once the Requirement Agent
+                    # has extracted that duration, complete the end date from
+                    # the explicit start instead of defaulting to one day.
+                    if merged.get("start_date") and not merged.get("end_date"):
+                        try:
+                            start_value = date.fromisoformat(str(merged["start_date"]))
+                            merged["end_date"] = (
+                                start_value + timedelta(days=max_days - 1)
+                            ).isoformat()
+                        except (TypeError, ValueError):
+                            pass
+                merged["cross_sea_required"] = _coerce_optional_bool(
+                    merged.get("cross_sea_required")
+                )
+                cross_sea_mode = str(merged.get("cross_sea_mode") or "").strip().casefold()
+                cross_sea_mode = {
+                    "ship": "ferry",
+                    "boat": "ferry",
+                    "ferryboat": "ferry",
+                    "轮船": "ferry",
+                    "渡轮": "ferry",
+                    "船": "ferry",
+                    "飞机": "flight",
+                    "桥": "bridge",
+                    "跨海大桥": "bridge",
+                }.get(cross_sea_mode, cross_sea_mode)
+                merged["cross_sea_mode"] = (
+                    cross_sea_mode if cross_sea_mode in {"ferry", "flight", "bridge"} else None
+                )
+                merged["past_return_requested"] = _coerce_optional_bool(
+                    merged.get("past_return_requested")
+                )
+                merged["time_window_minutes"] = _coerce_time_window_minutes(
+                    merged.get("time_window_minutes")
+                )
+                merged["_intent_status"] = "ok"
+                merged["_intent_source"] = (
+                    "llm_destination_adjudication"
+                    if destination_adjudication_used
+                    else "llm_repair"
+                    if semantic_repair_used
+                    else "llm"
+                )
+                if semantic_repair_used:
+                    merged["_intent_repair_attempted"] = True
+                if destination_adjudication_used:
+                    merged["_destination_adjudication_used"] = True
+            merged.pop("_inferred_date_fields", None)
+            merged["_source_raw_text"] = raw_text
+            return merged
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return {
+                **structural,
+                "_intent_status": "unavailable",
+                "_intent_error": "REQUIREMENT_AGENT_UNAVAILABLE",
+            }
+
+    async def _repair_destination_payload(
+        self,
+        raw_text: str,
+        invalid_payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Ask the same semantic Agent to repair a malformed destination shape.
+
+        A model sometimes returns ``destination_name: "['西藏', '新疆']"``.
+        Treating that value as a normal string is dangerous because the map
+        geocoder may resolve a similarly named restaurant or university.  The
+        repair is deliberately another LLM call, not ``ast.literal_eval`` or
+        a keyword table, so the Agent remains responsible for entity boundaries
+        and administrative scope.
+        """
+        repair_prompt = (
+            "你是 Rovia Requirement Agent 的 JSON 修复回合。原始用户需求如下。"
+            "上一回合的目的地字段类型不合法，绝不能把数组字符串当作地点。请根据原文重新理解，"
+            "只返回一个 JSON 对象，字段为 destination_name（单个规范字符串或 null）、"
+            "destination_names（按用户顺序排列的规范字符串数组）、destination_scope（poi/city/province/"
+            "region/multi_destination/unknown）、origin_name（字符串或 null）、travel_intents（字符串数组）、"
+            "must_visit_names（字符串数组）。省份/城市必须保留行政区名称，不要替换成附近餐馆、校园或酒店；"
+            "‘看流星雨’等体验放入 travel_intents，不要变成地点。"
+            f"原始需求：{raw_text}；错误回合：{json.dumps(invalid_payload, ensure_ascii=False)}"
+        )
+        repaired = _parse_json_object(
+            await deepseek_complete(
+                self.settings,
+                repair_prompt,
+                timeout=min(llm_timeout_seconds(self.settings), 45),
+                agent_name="requirement_repair",
+            )
+        )
+        if _destination_payload_needs_repair(repaired):
+            raise ValueError("LLM returned an invalid destination shape after repair")
+        return repaired
+
+    async def _repair_missing_core_fields(
+        self,
+        raw_text: str,
+        parsed: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Ask the semantic Agent to fill route anchors omitted in one turn.
+
+        This is intentionally a semantic retry rather than a deterministic
+        extraction fallback.  The retry is only made when a core field is
+        absent, keeps all fields returned by the first turn, and is forbidden
+        from overwriting an existing value.  That makes transient partial
+        JSON responses recoverable without allowing a random POI search result
+        to become the user's origin or destination.
+        """
+        if not isinstance(parsed, dict):
+            return {}, False
+
+        missing: list[str] = []
+        if not str(parsed.get("origin_name") or "").strip():
+            missing.append("origin_name")
+        if (
+            not str(parsed.get("destination_name") or "").strip()
+            and not _normalize_destination_names(parsed.get("destination_names"))
+        ):
+            missing.extend(["destination_name", "destination_names"])
+        if not missing:
+            return parsed, False
+
+        repair_prompt = (
+            "You are the Rovia Requirement Agent on a focused semantic repair turn. "
+            "The first extraction was valid JSON but omitted one or more route-anchor fields. "
+            "Read the user's full natural-language request again and fill ONLY the missing fields. "
+            "Do not use a keyword table, nearby search result, restaurant, hotel, school or campus "
+            "as a substitute for a city/province/region. Do not invent a place. "
+            "Return one JSON object only with these keys: origin_name, destination_name, "
+            "destination_names, destination_scope. Use null for an unknown scalar and [] for an "
+            "unknown list. Preserve the administrative name when the user names a city, province "
+            "or region; preserve every explicitly requested destination in order. "
+            f"Missing fields: {json.dumps(missing, ensure_ascii=False)}. "
+            f"First extraction: {json.dumps(parsed, ensure_ascii=False)}. "
+            f"User request: {raw_text}"
+        )
+        try:
+            repaired = _parse_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    repair_prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="requirement_repair",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return parsed, False
+
+        if _destination_payload_needs_repair(repaired):
+            return parsed, False
+
+        result = dict(parsed)
+        changed = False
+        for field in ("origin_name", "destination_name", "destination_scope"):
+            if field not in missing:
+                continue
+            value = repaired.get(field)
+            if isinstance(value, str) and value.strip():
+                result[field] = value.strip()[:120]
+                changed = True
+        if "destination_names" in missing:
+            names = _normalize_destination_names(repaired.get("destination_names"))
+            if names:
+                result["destination_names"] = names
+                changed = True
+        # A repair that supplied one canonical destination may omit the list;
+        # that one-item list is still a typed Agent decision and can be used as
+        # the route anchor during normal normalization below.
+        if "destination_names" in missing and "destination_name" in missing:
+            canonical = str(result.get("destination_name") or "").strip()
+            if canonical and not _normalize_destination_names(result.get("destination_names")):
+                result["destination_names"] = [canonical]
+                changed = True
+        return result, changed
+
+    async def _adjudicate_destination_anchor(
+        self,
+        raw_text: str,
+        parsed: dict[str, Any],
+    ) -> tuple[dict[str, Any], bool]:
+        """Resolve an administrative parent/child ambiguity with the Agent.
+
+        A first extraction can legitimately identify both ``河南`` and
+        ``郑州``.  Sending that pair straight to geocoding makes the province
+        win by accident and moves the whole trip to a province centroid.  This
+        focused semantic turn asks the same model to decide entity boundaries;
+        no city table, keyword parser or nearby POI is used here.  Province-only
+        requests remain provinces, while a more specific city/area mentioned in
+        the same destination phrase becomes the route anchor.
+        """
+        if not isinstance(parsed, dict):
+            return parsed, False
+        scope = str(parsed.get("destination_scope") or "unknown").strip().lower()
+        names = _normalize_destination_names(parsed.get("destination_names"))
+        # Multi-destination output is already an explicit ordered list.  A
+        # province/region result, or a non-multi list with multiple names, is
+        # the ambiguity shape that needs an entity-boundary adjudication.
+        if scope not in {"province", "region"} and not (
+            len(names) > 1 and scope != "multi_destination"
+        ):
+            return parsed, False
+        prompt = (
+            "你是 Rovia 目的地实体边界复核智能体，只复核目的地字段，不规划路线，也不查询附近 POI。"
+            "请重新阅读用户原文和上一回合结果。若同一目的地短语同时出现上级行政区与更具体的城市、"
+            "县区或景区（例如‘河南郑州附近’），必须选择更具体且实际承载游览的下级作为 destination_name，"
+            "scope 设为 city/district/poi 中最合适的一项；‘附近、周边、及其周边’只是范围修饰，不是第二个地点。"
+            "只有用户明确要去多个互相独立的城市/地区时，才保留 multi_destination 和完整有序列表。"
+            "如果原文只写省份或大区，没有更具体子地点，就保留省份/大区及 province/region scope，不能擅自挑城市。"
+            "严禁把餐馆、酒店、学校、园区、站点或搜索结果当成行政区。"
+            "只返回 JSON：{\"destination_name\":\"...\",\"destination_names\":[\"...\"],"
+            "\"destination_scope\":\"poi|city|province|region|multi_destination|unknown\"}。"
+            f"用户原文：{raw_text}；上一回合：{json.dumps({k: parsed.get(k) for k in ('destination_name', 'destination_names', 'destination_scope')}, ensure_ascii=False)}"
+        )
+        try:
+            adjudicated = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="destination_entity_adjudicator",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return parsed, False
+        if _destination_payload_needs_repair(adjudicated):
+            return parsed, False
+        result = dict(parsed)
+        name = adjudicated.get("destination_name")
+        normalized_name = _normalize_place_name(name) if isinstance(name, str) else ""
+        normalized_names = _normalize_destination_names(adjudicated.get("destination_names"))
+        if normalized_name:
+            result["destination_name"] = normalized_name
+        if normalized_names:
+            result["destination_names"] = normalized_names
+        elif normalized_name:
+            result["destination_names"] = [normalized_name]
+        adjudicated_scope = str(adjudicated.get("destination_scope") or "").strip().lower()
+        if adjudicated_scope in {"poi", "city", "province", "region", "multi_destination", "unknown"}:
+            result["destination_scope"] = adjudicated_scope
+        # An adjudicator that returned no usable destination did not make a
+        # decision; retain the first extraction and allow normal clarification.
+        if not result.get("destination_name") and not result.get("destination_names"):
+            return parsed, False
+        return result, True
+
+
+class RequirementValidationAgent:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def validate(
+        self,
+        raw_text: str,
+        extracted: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not llm_is_configured(self.settings):
+            return []
+        prompt = (
+            "你是 Rovia Requirement Guard，只检查旅行需求是否自相矛盾、"
+            "明显不可执行或缺少必须由用户决定的信息，不规划路线，不重复检查"
+            "出发地、目的地、日期顺序、跨海方式和明确时间窗。"
+            "若结构化需求已有出发地、目的地、开始和结束日期，不得返回笼统的"
+            "SEMANTIC_MISSING_INFO。‘周日到周三玩三天’中的三天可以表示三个完整"
+            "游玩日，首尾还包含接驳，不是必须追问的日期矛盾；不要返回"
+            "SEMANTIC_DURATION_MISMATCH。预算、精确酒店和具体班次可由规划智能体"
+            "按默认偏好选择，也不是必须由用户补充的信息。"
+            "返回单个 JSON：{\"issues\":[{\"code\":\"SEMANTIC_*\","
+            "\"message\":\"给用户的简短问题\",\"field\":\"preferences\","
+            "\"answer_type\":\"text\",\"options\":[]}]}。没有问题返回 {\"issues\":[]}。"
+            f"结构化需求：{json.dumps(extracted, ensure_ascii=False)}；原始需求：{raw_text}"
+        )
+        try:
+            payload = _parse_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=llm_timeout_seconds(self.settings),
+                    agent_name="requirement_validator",
+                )
+            )
+            if isinstance(payload, dict):
+                issues = payload.get("issues", [])
+                if not isinstance(issues, list):
+                    return []
+                return [
+                    {
+                        "code": str(item.get("code") or "SEMANTIC_REQUIREMENT"),
+                        "message": str(item.get("message") or "请进一步确认该项需求。"),
+                        "field": str(item.get("field") or "preferences"),
+                        "answer_type": (
+                            item.get("answer_type")
+                            if item.get("answer_type") in {"text", "date", "choice", "time"}
+                            else "text"
+                        ),
+                        "options": [str(option) for option in item.get("options", [])][:5],
+                    }
+                    for item in issues[:5]
+                    if isinstance(item, dict)
+                ]
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return []
+
+
+class TripEditAgent:
+    """Interpret free-form edits before the deterministic patch builder runs.
+
+    The patch builder remains the only component allowed to mutate a trip.  This
+    Agent only turns natural language into a small, validated intent so the
+    chat panel can handle requests such as "多加一天" or "把第二天晚上换成
+    夜游" instead of falling back to a canned help sentence.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def interpret(
+        self,
+        message: str,
+        trip_context: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not llm_is_configured(self.settings):
+            return None
+        prompt = (
+            "你是 Rovia 行程修改 Agent。你只能理解用户要如何调整已经存在的行程，"
+            "不能虚构不存在的景点、酒店或餐厅，也不能直接声称修改已经完成。"
+            "请只返回一个 JSON 对象，不要 Markdown："
+            '{"intent":"add|delete|replace|replan|adjust|question|unknown",'
+            '"day_index":1,"day_id":"","category":"attractions|hotels|meals|null",'
+            '"target_stage_id":"","target_activity_id":"","candidate_id":"",'
+              '"target_name":"","candidate_name":"","duration_minutes":null,'
+              '"duration_delta_minutes":0,'
+              '"origin_name":"","destination_name":"","start_date":"","end_date":"",'
+              '"departure_time":"","return_time":"","departure_period":"morning|afternoon|evening|null","transport_modes":[],'
+              '"must_visit_names":[],"exclude_names":[],"restore_names":[],"stay_only_at_destination":false,'
+              '"reply":"给用户的简短中文说明"}。'
+             "如果用户要求增加或减少天数、重排整体路线、改变出发/返回日期，intent 用 replan。"
+             "如果用户要求改成高铁/火车/飞机/自驾/轮船，必须用 replan，并在 transport_modes 返回 train/flight/driving/ferry；"
+             "不要沿用旧交通方式。‘早上/上午出发’返回 departure_time=09:00，‘下午出发’返回 14:00，‘晚上出发’返回 19:00；"
+             "这些是时间偏好而非具体班次，后续由班次查询智能体核对可用性。"
+             "如果一句话同时明确指出一个现有安排和一个新的地点（例如‘把 A 替换为 B’、‘把 A 换成 B’、‘A 改成 B’），"
+             "intent 必须用 replace，并填写 target_activity_id/target_name 与 candidate_name；只有‘再加/新增/添加’才用 add。"
+             "即使上下文提供了 current_target_id，也不能把明确的替换请求误判为新增。"
+             "如果是加入/删除/替换一个已有候选，尽量填出对应第几天和名称；不确定时留空，"
+            "优先返回上下文中的 day_id、阶段 ID、活动 ID、候选 ID；名称仅用于精确核对，禁止返回不存在的 ID。"
+              "不要把‘看流星雨’、‘赏花’、‘泡温泉’等体验目标误当成景点名称。"
+              "如果用户说‘这几天都住/玩在某地、不去其他地方’，用 replan 并将 stay_only_at_destination=true；"
+              "用户明确点名的地点放入 must_visit_names，体验目标不要放入该数组。"
+              "上下文中的 excluded_places 是用户已经明确删除的安排；除非本次消息明确要求恢复/重新加入，"
+              "否则不要把其中的地点作为 add、replace 或 must_visit_names 返回。"
+              "只有用户明确要求恢复已删除地点时，才把地点写入 restore_names。"
+            f"当前行程上下文：{json.dumps(trip_context, ensure_ascii=False)}；"
+            f"用户修改请求：{message}"
+        )
+        try:
+            value = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="trip_editor",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return None
+        intent = str(value.get("intent") or "unknown").strip().lower()
+        if intent not in {"add", "delete", "replace", "replan", "adjust", "question", "unknown"}:
+            intent = "unknown"
+        category = value.get("category")
+        if category not in {"attractions", "hotels", "meals"}:
+            category = None
+        try:
+            day_index = int(value.get("day_index")) if value.get("day_index") is not None else None
+        except (TypeError, ValueError):
+            day_index = None
+        try:
+            delta = int(value.get("duration_delta_minutes") or 0)
+        except (TypeError, ValueError):
+            delta = 0
+        try:
+            duration = int(value.get("duration_minutes")) if value.get("duration_minutes") is not None else None
+        except (TypeError, ValueError):
+            duration = None
+        duration = max(30, min(240, duration)) if duration is not None else None
+        raw_transport_modes = value.get("transport_modes")
+        if isinstance(raw_transport_modes, str):
+            raw_transport_modes = [raw_transport_modes]
+        transport_modes = _normalize_transport_modes(raw_transport_modes)
+        departure_time = _normalize_clock(value.get("departure_time"))
+        return_time = _normalize_clock(value.get("return_time"))
+        departure_period = str(value.get("departure_period") or "").strip().lower()
+        if departure_period not in {"morning", "afternoon", "evening"}:
+            departure_period = None
+        return {
+            "intent": intent,
+            "day_index": day_index,
+            "day_id": str(value.get("day_id") or "").strip()[:120],
+            "category": category,
+            "target_stage_id": str(value.get("target_stage_id") or "").strip()[:120],
+            "target_activity_id": str(value.get("target_activity_id") or "").strip()[:120],
+            "candidate_id": str(value.get("candidate_id") or "").strip()[:200],
+            "target_name": str(value.get("target_name") or "").strip()[:120],
+            "candidate_name": str(value.get("candidate_name") or "").strip()[:120],
+              "duration_minutes": duration,
+              "duration_delta_minutes": max(-240, min(240, delta)),
+              "origin_name": str(value.get("origin_name") or "").strip()[:120],
+              "destination_name": str(value.get("destination_name") or "").strip()[:120],
+              "start_date": str(value.get("start_date") or "").strip()[:20],
+              "end_date": str(value.get("end_date") or "").strip()[:20],
+              "departure_time": departure_time,
+              "return_time": return_time,
+              "departure_period": departure_period,
+              "transport_modes": transport_modes,
+              "must_visit_names": [str(item).strip()[:120] for item in (value.get("must_visit_names") or []) if str(item).strip()][:40],
+              "exclude_names": [str(item).strip()[:120] for item in (value.get("exclude_names") or []) if str(item).strip()][:40],
+              "restore_names": [str(item).strip()[:120] for item in (value.get("restore_names") or []) if str(item).strip()][:40],
+              "stay_only_at_destination": bool(value.get("stay_only_at_destination")),
+              "reply": str(value.get("reply") or "").strip()[:500],
+        }
+
+
+class PoiCuratorAgent:
+    """Let the planning agent reconcile AMap and OSM/OpenTripMap POIs."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def curate(
+        self,
+        destination_name: str,
+        local_candidates: list[dict[str, Any]],
+        osm_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        # Merging two POI sources is a semantic decision.  Never guess it from
+        # a local substring/keyword table when the curator Agent is unavailable.
+        if not llm_is_configured(self.settings) or not osm_items:
+            return []
+        local_places = [item.get("place", {}) for item in local_candidates]
+        compact_osm = [
+            {
+                "source_id": item.get("id"),
+                "name": item.get("name"),
+                "longitude": item.get("longitude"),
+                "latitude": item.get("latitude"),
+                "distance_m": item.get("distance_m"),
+                "kinds": item.get("kinds"),
+            }
+            for item in osm_items
+        ]
+        prompt = (
+            "你是 Rovia 的多源 POI 策展 Agent。请比较高德本地候选与 OpenStreetMap/"
+            "OpenTripMap 候选，结合名称语义、坐标距离和类别判断是否为同一真实景点。"
+            "对每个 OSM 候选输出一个决定：merge 表示合并到同一地点，add 表示作为独立景点加入，"
+            "skip 表示信息不足或明显无旅游价值。所有最终展示名必须是自然、准确的简体中文；"
+            "不要凭空创造景点。只返回 JSON："
+            '{"decisions":[{"source_id":"...","action":"merge|add|skip",'
+            '"display_name_zh":"...","merge_target_name":"...","reason":"..."}]}。'
+            f"目的地：{destination_name}；高德候选：{json.dumps(local_places, ensure_ascii=False)}；"
+            f"OSM 候选：{json.dumps(compact_osm, ensure_ascii=False)}"
+        )
+        try:
+            payload = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=llm_timeout_seconds(self.settings),
+                    agent_name="poi_curator",
+                )
+            )
+            if isinstance(payload, dict):
+                decisions = payload.get("decisions")
+                if not isinstance(decisions, list):
+                    return []
+                valid_ids = {str(item.get("id")) for item in osm_items}
+                cleaned = []
+                for item in decisions:
+                    if not isinstance(item, dict):
+                        continue
+                    source_id = str(item.get("source_id") or "")
+                    action = str(item.get("action") or "skip")
+                    display_name = str(item.get("display_name_zh") or "").strip()
+                    if source_id not in valid_ids or action not in {"merge", "add", "skip"}:
+                        continue
+                    if action == "add" and not _has_cjk(display_name):
+                        action = "skip"
+                    cleaned.append(
+                        {
+                            "source_id": source_id,
+                            "action": action,
+                            "display_name_zh": display_name,
+                            "merge_target_name": str(item.get("merge_target_name") or "").strip(),
+                            "reason": str(item.get("reason") or "智能体多源核验"),
+                        }
+                    )
+                return cleaned
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return []
+
+
+class DestinationResearchAgent:
+    """Turn destination search evidence into source-backed highlights."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def summarize(
+        self,
+        destination: str,
+        research: dict[str, Any],
+        trip_request: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not llm_is_configured(self.settings):
+            return []
+        evidence = [
+            {
+                "index": index,
+                "title": item.get("title"),
+                "snippet": item.get("snippet"),
+                "url": item.get("url") or item.get("detail_url"),
+                "category_hint": item.get("category_hint"),
+            }
+            for index, item in enumerate(
+                [*(research.get("web_sources") or []), *(research.get("flyai_items") or [])][:36]
+            )
+        ]
+        semantic_text = str(research.get("flyai_semantic_text") or "").strip()
+        if semantic_text:
+            evidence.append(
+                {
+                    "index": len(evidence),
+                    "title": "飞猪目的地语义搜索",
+                    "snippet": semantic_text[:6000],
+                    "url": "https://flyai.open.fliggy.com/",
+                    "category_hint": "attractions_and_meals",
+                }
+            )
+        if not evidence:
+            return []
+        local_anchor_instruction = (
+            "这是一个用户明确指定的景区或具体地点锚点。短途行程应把大部分景点、餐饮和住宿留在该锚点周边，"
+            "优先自然景观、代表性文化地点和有证据支持的本地餐饮；不要因为搜索结果出现就加入远处的 KTV、娱乐城、"
+            "普通商场或无关学校。只有用户明确要求时才推荐娱乐项目。"
+            if trip_request.get("destination_scope") == "poi"
+            or trip_request.get("stay_only_at_destination")
+            else ""
+        )
+        preference_instruction = (
+            "用户偏好自然景观：每天优先安排有公开证据的河流、湖泊、山地、湿地、公园或近郊景区，"
+            "可以覆盖目的地周边代表性区域，但不要用普通城区商业点凑数。"
+            if any("自然" in str(value) or "户外" in str(value) for value in trip_request.get("preferences", []))
+            else ""
+        )
+        prompt = (
+            "You are Rovia Destination Research Agent. Based ONLY on supplied web/FlyAI evidence, "
+            "identify famous, source-backed must-see attractions and representative local foods. "
+            "For a city destination, cover different districts and landmark types instead of only places near a hotel; "
+            "for a province or broad region, first organize the evidence into representative cities/景区片区 and "
+            "select nationally or locally recognized landmarks before nearby generic POIs; "
+            "return enough distinct attractions for the number of travel days (up to 12 attraction recommendations). "
+            "Do not invent names, choose a restaurant/university/campus as a province or city destination, or promote "
+            "obscure nearby POIs just because they are close to a geocoder point. A road/street, travel agency, tour operator, "
+            "ticket office, company, transport facility or a search result merely containing a famous scenic name is NOT an "
+            "attraction. Verify that each attraction name identifies a place a traveller can actually enter and visit. "
+            "Do not turn an experience into a place name. "
+            f"{local_anchor_instruction} {preference_instruction} "
+            "Return JSON only: {\"recommendations\":[{\"name\":\"...\",\"category\":\"attractions|meals\","
+            "\"entity_type\":\"attraction|restaurant\",\"is_visitable\":true,"
+            "\"importance\":0,\"area\":\"城区或地理片区\",\"suggested_minutes\":180,"
+            "\"visit_scale\":\"major|compact|indoor|outdoor|unknown\","
+            "\"best_time\":\"morning|afternoon|evening|any\",\"reason\":\"中文依据\","
+            "\"source_indexes\":[0]}]}. "
+            "importance is 0-100 and reflects local fame and evidence quality. "
+            f"Destination: {destination}; trip request: {json.dumps(trip_request, ensure_ascii=False)}; "
+            f"evidence: {json.dumps(evidence, ensure_ascii=False)}"
+        )
+        try:
+            payload = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="destination_research",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return []
+        raw = payload.get("recommendations")
+        if not isinstance(raw, list):
+            return []
+        cleaned: list[dict[str, Any]] = []
+        for item in raw[:24]:
+            if not isinstance(item, dict):
+                continue
+            category = item.get("category")
+            name = str(item.get("name") or "").strip()
+            if category not in {"attractions", "meals"} or not name:
+                continue
+            entity_type = str(item.get("entity_type") or "").strip().lower()
+            is_visitable = item.get("is_visitable")
+            if category == "attractions" and (
+                is_visitable is False
+                or entity_type in {
+                    "road",
+                    "street",
+                    "travel_agency",
+                    "tour_operator",
+                    "business",
+                    "service",
+                    "transport_facility",
+                }
+            ):
+                continue
+            try:
+                importance = float(item.get("importance") or 0)
+            except (TypeError, ValueError):
+                importance = 0
+            indexes = item.get("source_indexes")
+            cleaned.append(
+                {
+                    "name": name[:120],
+                    "category": category,
+                    "entity_type": entity_type or (
+                        "attraction" if category == "attractions" else "restaurant"
+                    ),
+                    "is_visitable": is_visitable is not False,
+                    "importance": max(0.0, min(100.0, importance)),
+                    "area": str(item.get("area") or "").strip()[:80],
+                    "suggested_minutes": _coerce_positive_minutes(
+                        item.get("suggested_minutes")
+                    )
+                    or 180,
+                    "visit_scale": (
+                        item.get("visit_scale")
+                        if item.get("visit_scale") in {
+                            "major", "compact", "small", "quick", "short", "indoor", "outdoor"
+                        }
+                        else "unknown"
+                    ),
+                    "best_time": (
+                        item.get("best_time")
+                        if item.get("best_time") in {"morning", "afternoon", "evening", "any"}
+                        else "any"
+                    ),
+                    "reason": str(item.get("reason") or "来源支持的目的地推荐").strip()[:240],
+                    "source_indexes": [
+                        int(index)
+                        for index in indexes
+                        if isinstance(index, int) and 0 <= index < len(evidence)
+                    ][:8]
+                    if isinstance(indexes, list)
+                    else [],
+                }
+            )
+        return cleaned
+
+
+class DestinationPlanAgent:
+    """Turn destination evidence into a high-level, routeable trip brief.
+
+    This is intentionally separate from the route adapter.  The Agent first
+    selects recognizable, source-backed landmarks and geographic clusters;
+    only after this brief is available does the graph ask map/schedule tools
+    for executable legs.  A province therefore becomes a set of representative
+    city/area clusters instead of a random POI returned by geocoding.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def draft(
+        self,
+        destinations: list[str],
+        research: dict[str, Any],
+        trip_request: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not llm_is_configured(self.settings):
+            return {}
+        recommendations = research.get("agent_recommendations") or []
+        if not recommendations and research.get("destinations"):
+            recommendations = [
+                item
+                for bundle in research.get("destinations", [])
+                if isinstance(bundle, dict)
+                for item in bundle.get("agent_recommendations", [])
+                if isinstance(item, dict)
+            ]
+        local_anchor_instruction = (
+            "这是具体景区/地点锚点，不是城市范围搜索。请把每天主轴、住宿和餐饮集中在锚点周边，"
+            "只选择证据充分且与用户兴趣匹配的自然或文化地点；不要塞入远处的 KTV、娱乐城、普通商场或无关学校。"
+            if trip_request.get("destination_scope") == "poi"
+            or trip_request.get("stay_only_at_destination")
+            else ""
+        )
+        preference_instruction = (
+            "用户偏好自然景观：每天优先安排有公开证据的河流、湖泊、山地、湿地、公园或近郊景区，"
+            "可以覆盖目的地周边代表性区域，但不要用普通城区商业点凑数。"
+            if any("自然" in str(value) or "户外" in str(value) for value in trip_request.get("preferences", []))
+            else ""
+        )
+        prompt = (
+            "你是 Rovia 目的地行程策划 Agent。你已经拿到公开网页和旅行信息服务的证据，"
+            "现在只写一份供路线 Agent 执行的高层计划单，不直接返回地图坐标。"
+            "对于省份/大区域，必须拆成有代表性的城市或景区片区；对于城市，必须覆盖不同片区的著名地标，"
+            "不要只围绕酒店，不要把学校、餐馆或搜索结果中的偶然地点当作目的地。"
+            "根据用户日期、交通、人数和舒适度约束安排每天的主轴，给出景点、三餐和住宿区域的建议。"
+            f"{local_anchor_instruction} {preference_instruction} "
+            "没有证据支持的地点不要写入 selected_attractions。只返回 JSON："
+            '{"strategy":"中文总体策略","selected_attractions":[{"name":"...","destination":"...",'
+            '"area":"...","reason":"..."}],"day_plans":[{"day":1,"focus":"...",'
+            '"area":"...","attraction_names":["..."],"meal_notes":["早餐","午餐","晚餐"],'
+            '"overnight_area":"...","reason":"..."}],"unresolved_questions":[]}。'
+            f"目的地列表：{json.dumps(destinations, ensure_ascii=False)}；"
+            f"用户约束：{json.dumps(trip_request, ensure_ascii=False)}；"
+            f"目的地研究与候选：{json.dumps({**research, 'agent_recommendations': recommendations}, ensure_ascii=False)}"
+        )
+        try:
+            payload = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="destination_planner",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+        selected = []
+        for item in payload.get("selected_attractions", [])[:30]:
+            if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+                continue
+            selected.append(
+                {
+                    "name": str(item.get("name")).strip()[:120],
+                    "destination": str(item.get("destination") or "").strip()[:80],
+                    "area": str(item.get("area") or "").strip()[:80],
+                    "reason": str(item.get("reason") or "").strip()[:240],
+                }
+            )
+        days = []
+        for item in payload.get("day_plans", [])[:30]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                day = int(item.get("day"))
+            except (TypeError, ValueError):
+                continue
+            names = _normalize_text_list(item.get("attraction_names"), maximum=12)
+            days.append(
+                {
+                    "day": max(1, day),
+                    "focus": str(item.get("focus") or "").strip()[:160],
+                    "area": str(item.get("area") or "").strip()[:80],
+                    "attraction_names": names,
+                    "meal_notes": _normalize_text_list(item.get("meal_notes"), maximum=6),
+                    "overnight_area": str(item.get("overnight_area") or "").strip()[:100],
+                    "reason": str(item.get("reason") or "").strip()[:240],
+                }
+            )
+        return {
+            "strategy": str(payload.get("strategy") or "").strip()[:500],
+            "selected_attractions": selected,
+            "day_plans": days,
+            "unresolved_questions": _normalize_text_list(
+                payload.get("unresolved_questions"), maximum=8
+            ),
+            "source": "destination_plan_agent",
+        }
+
+
+class PoiRankerAgent:
+    """Rank discovered POIs from the Agent's semantic requirements.
+
+    The local scorer is deliberately objective (distance, rating and price).
+    Preference words are not interpreted with a Python keyword table; when an
+    When the configured model is available this Agent decides the trade-offs and supplies the
+    human-readable reason shown in the UI.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def rank(
+        self,
+        candidates: dict[str, list[dict[str, Any]]],
+        preferences: list[str],
+        special_events: list[str],
+        *,
+        travel_start: str | None = None,
+        travel_end: str | None = None,
+        destination_research: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        if not llm_is_configured(self.settings):
+            return []
+        compact: list[dict[str, Any]] = []
+        for category, items in candidates.items():
+            for item in items[:40]:
+                place = item.get("place") or {}
+                compact.append(
+                    {
+                        "candidate_id": item.get("candidate_id"),
+                        "category": category,
+                        "name": place.get("name"),
+                        "categories": item.get("categories"),
+                        "description": item.get("description"),
+                        "rating": item.get("rating"),
+                        "distance_km": item.get("distance_km"),
+                        "price": item.get("ticket_or_price"),
+                    }
+                )
+        if not compact:
+            return []
+        prompt = (
+            "Travel dates: "
+            f"{travel_start or 'unknown'} to {travel_end or travel_start or 'unknown'}. "
+            "Assess seasonal_fit for every candidate; reject clearly off-season outdoor activities, "
+            "but keep indoor or all-season venues when provider details support them. "
+            "Return seasonal_fit and seasonal_reason in each decision. "
+            "For category=attractions, do not rank a nearby KTV/nightclub, pharmacy/clinic, "
+            "school/campus, shopping mall, road/street, travel agency/tour operator, company, "
+            "transport facility or generic service facility as a scenic attraction "
+            "unless the user explicitly asks for it; nearby-search noise must receive a low score. "
+            f"Destination research evidence (use it to prioritize famous source-backed places, never as a hard-coded list): {json.dumps(destination_research or {}, ensure_ascii=False)}. "
+            "你是 Rovia POI 行程策展 Agent。请根据已经由 Requirement Agent 提取的偏好、特殊体验、"
+            "距离、评分、价格和类别，为候选景点、住宿、餐饮排序。不要从原始用户文本猜测偏好，"
+            "也不要凭空创造候选；只返回候选 ID 的 JSON 决策。可以遗漏不适合的候选。"
+            "返回格式：{\"decisions\":[{\"candidate_id\":\"...\",\"score\":0,"
+            "\"reason\":\"简短中文理由\"}]}。score 为 0-100 的相对匹配度。"
+            f"偏好：{json.dumps(preferences, ensure_ascii=False)}；"
+            f"特殊体验：{json.dumps(special_events, ensure_ascii=False)}；"
+            f"候选：{json.dumps(compact, ensure_ascii=False)}"
+        )
+        try:
+            payload = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="poi_ranker",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return []
+        decisions = payload.get("decisions")
+        if not isinstance(decisions, list):
+            return []
+        valid_ids = {str(item.get("candidate_id")) for item in compact}
+        cleaned: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            candidate_id = str(item.get("candidate_id") or "")
+            if not candidate_id or candidate_id not in valid_ids or candidate_id in seen:
+                continue
+            try:
+                score = float(item.get("score"))
+            except (TypeError, ValueError):
+                continue
+            seen.add(candidate_id)
+            cleaned.append(
+                {
+                    "candidate_id": candidate_id,
+                    "score": max(0.0, min(100.0, score)),
+                    "seasonal_fit": (
+                        bool(item.get("seasonal_fit"))
+                        if isinstance(item.get("seasonal_fit"), bool)
+                        else None
+                    ),
+                    "seasonal_reason": str(item.get("seasonal_reason") or "").strip()[:160],
+                    "reason": str(item.get("reason") or "智能体综合偏好、距离与数据质量").strip()[:120],
+                }
+            )
+        return cleaned
+
+
+class PoiSuitabilityAgent:
+    """Review every candidate against the actual travel conditions.
+
+    Ranking answers "which option is attractive".  This pass answers the
+    stricter question "can this specific option reasonably be visited on the
+    requested dates" using the candidate metadata, forecast, terrain and the
+    already extracted user preferences.  A missing/invalid answer is ignored
+    so the deterministic planner can keep working offline.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def review(
+        self,
+        candidates: dict[str, list[dict[str, Any]]],
+        trip_request: dict[str, Any],
+        day_plans: list[dict[str, Any]],
+        weather_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not llm_is_configured(self.settings):
+            return []
+        compact: list[dict[str, Any]] = []
+        for category, items in candidates.items():
+            for item in items:
+                place = item.get("place") or {}
+                coordinates = place.get("coordinates") or {}
+                compact.append(
+                    {
+                        "candidate_id": item.get("candidate_id"),
+                        "category": category,
+                        "name": place.get("name"),
+                        "address": place.get("address"),
+                        "description": item.get("description"),
+                        "categories": item.get("categories") or item.get("kinds"),
+                        "rating": item.get("rating"),
+                        "elevation_m": item.get("elevation_m"),
+                        "coordinates": coordinates,
+                        "provider": item.get("provider"),
+                        "opening_hours": item.get("opening_hours"),
+                    }
+                )
+        if not compact:
+            return []
+        weather = _compact_weather_centers(weather_results)
+        candidate_weather = _match_candidate_weather(compact, weather)
+        route_context = [
+            {
+                "day": day.get("date"),
+                "stages": [
+                    {
+                        "destination": (stage.get("destination") or {}).get("name"),
+                        "elevation_gain_m": stage.get("elevation_gain_m"),
+                        "weather": stage.get("weather_summary"),
+                    }
+                    for stage in day.get("stages", [])
+                ],
+            }
+            for day in day_plans
+        ]
+        prompt = (
+            "You are Rovia's POI safety and suitability Agent. Review EVERY "
+            "candidate independently; do not use a fixed month table. Consider "
+            "the requested date range, forecast temperature/precipitation/wind, "
+            "elevation and terrain, opening information, activity characteristics, "
+            "travel mode, party size and the user's preferences/special events. "
+            "Do not assume that every result returned by a nearby ‘景点’ search "
+            "is a sightseeing attraction. For category=attractions, a result "
+            "whose provider category or description is clearly a KTV/nightclub, "
+            "pharmacy/clinic, school/campus, shopping mall, generic service "
+            "facility, road/street, travel agency/tour operator, transport stop "
+            "or unrelated business is unsuitable unless the user "
+            "explicitly requested that exact place. When the extracted intent "
+            "prefers nature/scenery, mark entertainment, retail, medical and "
+            "other non-tourism businesses unsuitable and favor parks, lakes, "
+            "mountains, forests, museums and established scenic areas. "
+            "A seasonal activity can still be suitable when the provider details, "
+            "indoor setting or local conditions support it. Mark unsuitable only "
+            "when the evidence makes it unreasonable or unsafe. Return ONLY JSON: "
+            '{"decisions":[{"candidate_id":"...","suitable":true,'
+            '"confidence":"high|medium|low","reason":"中文依据",'
+            '"weather_reason":"...","terrain_reason":"...",'
+            '"personal_reason":"..."}]}。必须覆盖输入中的每个 candidate_id。'
+            f"\n行程需求：{json.dumps({key: trip_request.get(key) for key in ('start_date', 'end_date', 'preferences', 'special_events', 'travelers', 'destination')}, ensure_ascii=False)}"
+            f"\n候选：{json.dumps(compact, ensure_ascii=False)}"
+            f"\n天气中心：{json.dumps(weather, ensure_ascii=False)}"
+            f"\n候选对应天气：{json.dumps(candidate_weather, ensure_ascii=False)}"
+            f"\n路线地形与阶段天气：{json.dumps(route_context, ensure_ascii=False)}"
+        )
+        try:
+            payload = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="poi_suitability",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return []
+        decisions = payload.get("decisions")
+        if not isinstance(decisions, list):
+            return []
+        valid_ids = {str(item.get("candidate_id")) for item in compact}
+        cleaned: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in decisions:
+            if not isinstance(item, dict):
+                continue
+            candidate_id = str(item.get("candidate_id") or "")
+            suitable = item.get("suitable")
+            if (
+                not candidate_id
+                or candidate_id not in valid_ids
+                or candidate_id in seen
+                or not isinstance(suitable, bool)
+            ):
+                continue
+            confidence = str(item.get("confidence") or "low").lower()
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "low"
+            seen.add(candidate_id)
+            cleaned.append(
+                {
+                    "candidate_id": candidate_id,
+                    "suitable": suitable,
+                    "confidence": confidence,
+                    "reason": str(item.get("reason") or "智能体综合日期、天气、地形与偏好复核").strip()[:240],
+                    "weather_reason": str(item.get("weather_reason") or "").strip()[:160],
+                    "terrain_reason": str(item.get("terrain_reason") or "").strip()[:160],
+                    "personal_reason": str(item.get("personal_reason") or "").strip()[:160],
+                }
+            )
+        return cleaned
+
+
+def _compact_weather_centers(weather_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for result in weather_results[:30]:
+        samples = [sample for sample in result.get("hourly_samples", []) if isinstance(sample, dict)]
+        temperatures = [sample.get("temperature_c") for sample in samples if isinstance(sample.get("temperature_c"), (int, float))]
+        precipitation = [sample.get("precipitation_probability") for sample in samples if isinstance(sample.get("precipitation_probability"), (int, float))]
+        winds = [sample.get("wind_speed_kmh") for sample in samples if isinstance(sample.get("wind_speed_kmh"), (int, float))]
+        compact.append(
+            {
+                "latitude": result.get("latitude"),
+                "longitude": result.get("longitude"),
+                "elevation_m": result.get("elevation_m"),
+                "temperature_range_c": [min(temperatures), max(temperatures)] if temperatures else None,
+                "precipitation_probability_max": max(precipitation) if precipitation else None,
+                "wind_speed_max_kmh": max(winds) if winds else None,
+                "sample_count": len(samples),
+            }
+        )
+    return compact
+
+
+def _match_candidate_weather(
+    candidates: list[dict[str, Any]],
+    weather_centers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach the nearest forecast/elevation center to every candidate."""
+    matched: list[dict[str, Any]] = []
+    for candidate in candidates:
+        coordinates = candidate.get("coordinates") or {}
+        try:
+            longitude = float(coordinates["longitude"])
+            latitude = float(coordinates["latitude"])
+        except (KeyError, TypeError, ValueError):
+            matched.append({"candidate_id": candidate.get("candidate_id"), "weather": None})
+            continue
+        nearest = min(
+            weather_centers,
+            key=lambda center: (
+                (float(center.get("longitude") or 0) - longitude) ** 2
+                + (float(center.get("latitude") or 0) - latitude) ** 2
+            ),
+            default=None,
+        )
+        matched.append(
+            {
+                "candidate_id": candidate.get("candidate_id"),
+                "weather": nearest,
+            }
+        )
+    return matched
+
+
+class EventResearchAgent:
+    """Extract source-backed facts for a user-requested seasonal event.
+
+    Web search only supplies evidence.  This Agent turns the snippets into a
+    small structured record while being explicitly forbidden from filling an
+    unknown date/time from memory.  The caller can therefore show the exact
+    peak window and ask the user to choose dates around it.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def extract(
+        self,
+        event: str,
+        year: int,
+        sources: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if not llm_is_configured(self.settings) or not sources:
+            return {}
+        compact = [
+            {
+                "index": index,
+                "title": str(source.get("title") or ""),
+                "snippet": str(source.get("snippet") or ""),
+                "url": str(source.get("url") or ""),
+            }
+            for index, source in enumerate(sources[:8])
+        ]
+        prompt = (
+            "你是 Rovia 事件事实核验 Agent。只根据下面公开网页标题、摘要和链接提取事实，"
+            "不要依靠记忆补全，也不要把搜索词当成事实。返回且只能返回一个 JSON 对象："
+            '{"peak_start_date":"YYYY-MM-DD或null","peak_end_date":"YYYY-MM-DD或null",'
+            '"peak_time_utc":"HH:MM或null","peak_time_local":"HH:MM或null",'
+            '"peak_time_label":"来源原文中的时间表述或null",'
+            '"observation_window_local":"中文观测窗口或null","active_period":"活动期或null",'
+            '"zhr":null,"confidence":"high|medium|low",'
+            '"evidence_source_indexes":[0],"summary":"有证据支持的中文事实摘要"}。'
+            f"事件：{event}；目标年份：{year}。日期必须确实出现在来源中；只有来源明确给出时才填日期或时间，"
+            "如果来源互相矛盾，保留 null 并在 summary 说明需要临近出发复核。peak_time_local 使用北京时间/"
+            "当地时间的明确时刻；不能把‘夜间’臆造为具体小时。若来源给出了 02:00、上午/中午等具体"
+            "表述但时区不清，保留在 peak_time_label，不要强行转换成北京时间。zhr 只能填来源明确的数字。"
+            f"来源：{json.dumps(compact, ensure_ascii=False)}"
+        )
+        try:
+            payload = _parse_unfiltered_json_object(
+                await deepseek_complete(
+                    self.settings,
+                    prompt,
+                    timeout=min(llm_timeout_seconds(self.settings), 45),
+                    agent_name="event_research",
+                )
+            )
+        except (httpx.HTTPError, ValueError, TypeError, json.JSONDecodeError):
+            return {}
+        return _clean_event_facts(payload, year, len(compact))
+
+
+def _clean_event_facts(value: dict[str, Any], year: int, source_count: int) -> dict[str, Any]:
+    """Validate the event Agent's source-backed JSON before exposing it."""
+    facts: dict[str, Any] = {}
+    for field in ("peak_start_date", "peak_end_date"):
+        raw = value.get(field)
+        if isinstance(raw, str):
+            try:
+                parsed = date.fromisoformat(raw.strip())
+            except ValueError:
+                parsed = None
+            if parsed is not None and parsed.year == year:
+                facts[field] = parsed.isoformat()
+    for field in ("peak_time_utc", "peak_time_local"):
+        normalized = _normalize_clock(value.get(field))
+        if normalized:
+            facts[field] = normalized
+    for field in ("peak_time_label", "observation_window_local", "active_period", "summary"):
+        raw = value.get(field)
+        if isinstance(raw, str) and raw.strip():
+            facts[field] = raw.strip()[:500]
+    confidence = str(value.get("confidence") or "low").lower().strip()
+    facts["confidence"] = confidence if confidence in {"high", "medium", "low"} else "low"
+    indexes = value.get("evidence_source_indexes")
+    if isinstance(indexes, list):
+        facts["evidence_source_indexes"] = [
+            int(index)
+            for index in indexes
+            if isinstance(index, int) and 0 <= index < source_count
+        ][:8]
+    zhr = value.get("zhr")
+    if isinstance(zhr, (int, float)) and not isinstance(zhr, bool) and 0 <= zhr <= 10000:
+        facts["zhr"] = zhr
+    return facts
+
+
+# Backward-compatible import names for integrations written before the
+# provider-neutral adapter was introduced.  The implementation reads LLM_*
+# configuration at call time; these aliases do not select a vendor or model.
+DeepSeekRequirementExtractor = RequirementExtractionAgent
+DeepSeekRequirementValidator = RequirementValidationAgent
+DeepSeekTripEditAgent = TripEditAgent
+DeepSeekPoiCurator = PoiCuratorAgent
+DeepSeekDestinationResearchAgent = DestinationResearchAgent
+DeepSeekDestinationPlanAgent = DestinationPlanAgent
+DeepSeekPoiRanker = PoiRankerAgent
+DeepSeekPoiSuitabilityAgent = PoiSuitabilityAgent
+DeepSeekEventResearchAgent = EventResearchAgent
+OllamaRequirementExtractor = RequirementExtractionAgent
+OllamaRequirementValidator = RequirementValidationAgent
+OllamaTripEditAgent = TripEditAgent
+OllamaPoiCurator = PoiCuratorAgent
+OllamaDestinationResearchAgent = DestinationResearchAgent
+OllamaDestinationPlanAgent = DestinationPlanAgent
+OllamaPoiRanker = PoiRankerAgent
+OllamaPoiSuitabilityAgent = PoiSuitabilityAgent
+OllamaEventResearchAgent = EventResearchAgent
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    value = _parse_unfiltered_json_object(text)
+    allowed = {
+        "origin_name",
+        "destination_name",
+        "destination_names",
+        "destination_scope",
+        "travel_intents",
+        "start_date",
+        "end_date",
+        "departure_time",
+        "return_time",
+        "departure_period",
+        "travelers",
+        "preferences",
+        "transport_modes",
+        "special_events",
+        "max_days",
+        "issues",
+        "cross_sea_required",
+        "cross_sea_mode",
+        "past_return_requested",
+        "time_window_minutes",
+        "stay_only_at_destination",
+        "must_visit_names",
+    }
+    return {key: value for key, value in value.items() if key in allowed}
+
+
+def _looks_like_serialized_list(value: str) -> bool:
+    text = value.strip()
+    return len(text) >= 2 and text[0] == "[" and text[-1] == "]"
+
+
+def _normalize_text_list(value: Any, *, maximum: int = 40) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        text = re.sub(r"\s+", " ", item).strip(" \t\r\n，,。；;、:：")
+        if not text or text in seen:
+            continue
+        result.append(text[:120])
+        seen.add(text)
+        if len(result) >= maximum:
+            break
+    return result
+
+
+def _normalize_destination_names(value: Any) -> list[str]:
+    return _normalize_text_list(value, maximum=20)
+
+
+def _destination_payload_needs_repair(value: dict[str, Any]) -> bool:
+    """Reject ambiguous model shapes before anything reaches geocoding."""
+    destination_name = value.get("destination_name")
+    if destination_name is not None and (
+        not isinstance(destination_name, str)
+        or _looks_like_serialized_list(destination_name)
+    ):
+        return True
+    destination_names = value.get("destination_names")
+    if destination_names is not None and (
+        not isinstance(destination_names, list)
+        or any(not isinstance(item, str) or not item.strip() for item in destination_names)
+    ):
+        return True
+    return False
+
+
+def _parse_unfiltered_json_object(text: str) -> dict[str, Any]:
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if not match:
+        raise ValueError("LLM response does not contain JSON")
+    value = json.loads(match.group(0))
+    if not isinstance(value, dict):
+        raise ValueError("LLM response must be a JSON object")
+    return value
+
+
+def _has_cjk(value: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", value))
+
+
+def _merge_extraction(base: dict[str, Any], llm: dict[str, Any]) -> dict[str, Any]:
+    result = dict(base)
+    for key, value in llm.items():
+        if value not in (None, "", []):
+            result[key] = value
+    return result
+
+
+def _extract_literal_constraints(raw_text: str, today: date) -> dict[str, Any]:
+    """Extract only unambiguous numeric calendar literals for validation."""
+    explicit_dates = [
+        date.fromisoformat(value).isoformat()
+        for value in re.findall(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)", raw_text)
+    ]
+    for month, day_value in re.findall(
+        r"(?<!\d)(\d{1,2})[./](\d{1,2})(?!\d)", raw_text
+    ):
+        try:
+            explicit_dates.append(
+                date(today.year, int(month), int(day_value)).isoformat()
+            )
+        except ValueError:
+            continue
+    # Normal Chinese calendar forms are the authoritative structural signal.
+    # Support ranges where the month is written only once, for example
+    # “9月18到20号”, and single dates such as “9月12号”.
+    chinese_ranges = list(re.finditer(
+        r"(?<!\d)(?:(?P<year>\d{4})年)?(?P<month>\d{1,2})月"
+        r"(?P<day_start>\d{1,2})(?:日|号)?\s*"
+        r"(?:到|至|[-~～])\s*"
+        r"(?:(?P<end_month>\d{1,2})月)?(?P<day_end>\d{1,2})(?:日|号)?",
+        raw_text,
+    ))
+    covered_ranges: set[tuple[int, int]] = set()
+    for match in chinese_ranges:
+        try:
+            year = int(match.group("year") or today.year)
+            month = int(match.group("month"))
+            end_month = int(match.group("end_month") or month)
+            start_day = int(match.group("day_start"))
+            end_day = int(match.group("day_end"))
+            explicit_dates.extend(
+                [
+                    date(year, month, start_day).isoformat(),
+                    date(year, end_month, end_day).isoformat(),
+                ]
+            )
+            covered_ranges.add((match.start(), match.end()))
+        except ValueError:
+            continue
+    for match in re.finditer(
+        r"(?<!\d)(?:(?P<year>\d{4})年)?(?P<month>\d{1,2})月"
+        r"(?P<day>\d{1,2})(?:日|号)",
+        raw_text,
+    ):
+        if any(start <= match.start() < end for start, end in covered_ranges):
+            continue
+        try:
+            explicit_dates.append(
+                date(
+                    int(match.group("year") or today.year),
+                    int(match.group("month")),
+                    int(match.group("day")),
+                ).isoformat()
+            )
+        except ValueError:
+            continue
+    if not explicit_dates:
+        for year, month, day_value in re.findall(
+            r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日", raw_text
+        ):
+            try:
+                explicit_dates.append(
+                    date(
+                        int(year) if year else today.year,
+                        int(month),
+                        int(day_value),
+                    ).isoformat()
+                )
+            except ValueError:
+                continue
+    result: dict[str, Any] = {}
+    if explicit_dates:
+        result["start_date"] = explicit_dates[0]
+        if len(explicit_dates) > 1:
+            result["end_date"] = explicit_dates[1]
+    return result
+
+
+def _normalize_transport_modes(value: Any) -> list[str]:
+    """Keep only transport mode decisions returned by the Requirement Agent."""
+    allowed = {"driving", "train", "flight", "ferry", "transit", "walking", "riding"}
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    for item in value:
+        mode = str(item or "").strip().lower()
+        if mode in {"ship", "boat", "ferryboat", "轮船", "渡轮", "船"}:
+            mode = "ferry"
+        if mode in allowed and mode not in result:
+            result.append(mode)
+    return result
+
+
+_WEEKDAY_PATTERN = re.compile(r"(?P<scope>下周|下星期|本周|这周|周|星期)(?P<day>[一二三四五六日天])")
+_WEEKDAY_INDEX = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+_ENGLISH_WEEKDAY_PATTERN = re.compile(
+    r"(?P<scope>next\s+week\s+|next\s+|this\s+)?"
+    r"(?P<day>mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|"
+    r"thu(?:r(?:s(?:day)?)?)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_ENGLISH_WEEKDAY_INDEX = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+_CHINESE_WEEKDAY_PATTERN = re.compile(
+    r"(?P<scope>下周|下星期|下个星期|本周|这周|周|星期)"
+    r"(?P<day>[一二三四五六日天])"
+    r"(?![一二三四五六日天])"
+)
+_CHINESE_WEEKDAY_INDEX = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+_CHINESE_RELATIVE_DAY_OFFSETS = {
+    "后天": 2,
+    "大后天": 3,
+    "明天": 1,
+    "今天": 0,
+    "昨天": -1,
+    "前天": -2,
+}
+_RELATIVE_DAY_OFFSETS = {
+    "大后天": 3,
+    "后天": 2,
+    "明天": 1,
+    "今天": 0,
+    "昨天": -1,
+    "前天": -2,
+    "the day after tomorrow": 2,
+    "day after tomorrow": 2,
+    "tomorrow": 1,
+    "today": 0,
+    "yesterday": -1,
+    "day before yesterday": -2,
+}
+
+
+def _weekday_date(match: re.Match[str], today: date) -> date:
+    """Resolve one Chinese weekday token without interpreting travel intent."""
+    monday = today - timedelta(days=today.weekday())
+    candidate = monday + timedelta(days=_WEEKDAY_INDEX[match.group("day")])
+    scope = match.group("scope")
+    if scope in {"下周", "下星期"}:
+        candidate += timedelta(days=7)
+    elif scope in {"周", "星期", "本周", "这周"} and candidate < today:
+        # A travel request is prospective unless the user explicitly says it
+        # is historical.  On Monday, "这周日" must therefore mean the coming
+        # Sunday, not yesterday.  Keeping this legacy resolver aligned with
+        # ``_chinese_weekday_date`` also prevents the two overlapping regexes
+        # from producing an artificial Sunday-to-Wednesday range that starts
+        # in the past.
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _english_weekday_date(match: re.Match[str], today: date) -> date:
+    monday = today - timedelta(days=today.weekday())
+    day = match.group("day").casefold()[:3]
+    candidate = monday + timedelta(days=_ENGLISH_WEEKDAY_INDEX[day])
+    scope = (match.group("scope") or "").strip().casefold()
+    if scope in {"next", "next week"}:
+        candidate += timedelta(days=7)
+    elif scope == "" and candidate < today:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _chinese_weekday_date(match: re.Match[str], today: date) -> date:
+    monday = today - timedelta(days=today.weekday())
+    candidate = monday + timedelta(days=_CHINESE_WEEKDAY_INDEX[match.group("day")])
+    scope = (match.group("scope") or "").strip()
+    if scope in {"下周", "下星期", "下个星期"}:
+        candidate += timedelta(days=7)
+    elif scope in {"周", "星期", "本周", "这周", ""} and candidate < today:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _duration_constraint_status(raw_text: str) -> tuple[str, int | None]:
+    """Classify an explicit duration without deriving calendar dates.
+
+    ``valid`` is the small range supported by the deterministic calendar
+    fallback. ``invalid`` and ``out_of_fallback`` are deliberately kept
+    separate from ``none`` so values such as 0 or 31 cannot become a normal
+    weekend when the semantic agent is unavailable.
+    """
+    text = re.sub(r"\s+", " ", raw_text or "").strip()
+    if not text:
+        return "none", None
+
+    # This parser only recognizes an explicit number and a day/night unit. It
+    # never identifies a place, intent, or transport mode. Unicode escapes
+    # keep it readable in terminals with a non-UTF-8 locale.
+    chinese_num = r"[\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341\u767e\u5343\u4e07]+"
+    number = rf"(?P<num>\d+|{chinese_num})"
+    unit = r"(?:\u5929|\u65e5|days?|nights?)"
+    patterns = (
+        rf"(?:\u6700\u591a|\u81f3\u591a|\u4e0d\u8d85\u8fc7|\u6700\u591a\u4e0d\u8d85\u8fc7|"
+        rf"up\s+to|at\s+most|no\s+more\s+than)\s*{number}\s*{unit}",
+        rf"(?:\u73a9|\u5f85|\u6e38\u73a9|\u65c5\u884c|\u884c\u7a0b|\u65c5\u6e38|\u5ea6\u5047|stay|spend|trip|travel)\s*"
+        rf"{number}\s*{unit}",
+        rf"{number}\s*{unit}\s*(?:\u884c\u7a0b|\u65c5\u884c|\u65c5\u6e38|\u5ea6\u5047|trip|travel|stay)",
+    )
+    classifications: list[tuple[str, int]] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            raw_num = match.group("num")
+            days = int(raw_num) if raw_num.isdigit() else _chinese_numeral_to_int(raw_num)
+            if days <= 0:
+                classifications.append(("invalid", days))
+            elif days > 30:
+                classifications.append(("out_of_fallback", days))
+            else:
+                classifications.append(("valid", days))
+    if not classifications:
+        return "none", None
+    # Invalid/out-of-range values win over a valid value in contradictory text
+    # so the fallback cannot silently select a weekend.
+    for status in ("invalid", "out_of_fallback", "valid"):
+        for candidate, days in classifications:
+            if candidate == status:
+                return status, days
+    return "none", None
+
+
+def _extract_duration_days(raw_text: str) -> int | None:
+    """Extract an explicit trip-length bound such as 最多五天/玩三天/5 days.
+
+    Returns the number of calendar days (inclusive) or None when the text
+    carries no duration.  Only unambiguous duration phrases are matched;
+    intent semantics stay with the Requirement Agent.
+    """
+    status, days = _duration_constraint_status(raw_text)
+    return days if status == "valid" else None
+
+
+def _chinese_numeral_to_int(value: str) -> int:
+    """Convert common Chinese numerals (一/十/二十一/两百七十七)."""
+    digits = {
+        "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+        "六": 6, "七": 7, "八": 8, "九": 9,
+    }
+    if not value:
+        return 0
+    total = 0
+    section = 0
+    number = 0
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+    for char in value:
+        if char in digits:
+            number = digits[char]
+            continue
+        unit = units.get(char)
+        if unit is None:
+            continue
+        if unit == 10000:
+            section = (section + number) * unit
+            total += section
+            section = 0
+        else:
+            section += (number or 1) * unit
+        number = 0
+    return total + section + number
+
+
+# Fixed-date Chinese public holidays.  The Requirement Agent resolves the
+# actual travel window; this table only lets the deterministic fallback
+# answer ``国庆节`` when the Agent is unavailable.
+_CHINESE_FIXED_HOLIDAYS: dict[str, tuple[int, int]] = {
+    "元旦": (1, 1),
+    "劳动节": (5, 1),
+    "国庆节": (10, 1),
+    "国庆": (10, 1),
+    "建军节": (8, 1),
+    "儿童节": (6, 1),
+    "妇女节": (3, 8),
+    "植树节": (3, 12),
+    "教师节": (9, 10),
+    "圣诞节": (12, 25),
+    "情人节": (2, 14),
+    "万圣节": (10, 31),
+    "感恩节": (11, 1),
+}
+
+
+def _holiday_window(raw_text: str, today: date) -> list[date]:
+    """Resolve a named holiday to a concrete date window.
+
+    Fixed-date holidays map to their calendar date.  Lunar holidays
+    (春节/中秋/端午/清明) cannot be resolved without a lunar calendar and are
+    left to the Requirement Agent; the fallback returns nothing for them.
+    """
+    text = raw_text or ""
+    for name, (month, day) in _CHINESE_FIXED_HOLIDAYS.items():
+        if re.search(name, text):
+            year = today.year
+            try:
+                holiday = date(year, month, day)
+            except ValueError:
+                continue
+            if holiday < today:
+                holiday = date(year + 1, month, day)
+            return [holiday, holiday + timedelta(days=4)]
+    return []
+
+
+def _next_month_calendar_window(raw_text: str, today: date) -> list[date]:
+    """Resolve a prospective ``下个月/next month`` weekend or weekday pair.
+
+    ``周末`` on its own means the next upcoming weekend, but a phrase such as
+    ``下个月找个周末`` must not be silently rewritten to this week. This helper
+    only handles calendar structure; place and intent semantics remain with
+    the Requirement Agent. When no particular weekend is named, the first
+    Saturday/Sunday of the target month is a stable draft that can be changed
+    during confirmation.
+    """
+    text = raw_text or ""
+    month_match = re.search(r"下个月|下月|下個月|next\s+month", text, re.IGNORECASE)
+    if not month_match:
+        return []
+    year = today.year + (1 if today.month == 12 else 0)
+    month = 1 if today.month == 12 else today.month + 1
+    first = date(year, month, 1)
+    tail = text[month_match.end() :]
+    if re.search(r"周末|週末|本月末|weekend", tail, re.IGNORECASE):
+        saturday = first + timedelta(days=(5 - first.weekday()) % 7)
+        return [saturday, saturday + timedelta(days=1)]
+
+    # Handle ``下个月周三到周五`` and English ``next month Wednesday-Friday``
+    # without maintaining a city or destination vocabulary.
+    chinese_tokens = re.findall(r"(?:周|星期|禮拜)([一二三四五六日天])", tail)
+    english_tokens = re.findall(
+        r"\b(mon(?:day)?|tue(?:s(?:day)?)?|wed(?:nesday)?|thu(?:r(?:sday)?)?|"
+        r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)\b",
+        tail,
+        re.IGNORECASE,
+    )
+    chinese_index = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
+    english_index = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+    weekday_indexes: list[int] = [chinese_index[token] for token in chinese_tokens]
+    weekday_indexes.extend(english_index[token.casefold()[:3]] for token in english_tokens)
+    if not weekday_indexes:
+        return []
+    dates: list[date] = []
+    for weekday in weekday_indexes[:2]:
+        candidate = first + timedelta(days=(weekday - first.weekday()) % 7)
+        if dates and candidate <= dates[-1]:
+            candidate += timedelta(days=7)
+        dates.append(candidate)
+    return dates
+
+
+def extract_structural_constraints(raw_text: str, today: date) -> dict[str, Any]:
+    """Extract only deterministic calendar structure for Agent fallback/validation.
+
+    This deliberately does not classify destinations, experiences, party size or
+    preferences.  A weekday pair such as “周一出发、周五回来” is a calendar
+    constraint, so resolving it here prevents a transient Agent failure from
+    asking the user for a date that is already unambiguous in the request.
+    """
+    result = _extract_literal_constraints(raw_text, today)
+
+    # An explicit request to cross a water barrier is a safety constraint, not
+    # a destination or preference guess.  Preserve it across clarification
+    # rounds even when the cloud Requirement Agent is unavailable; do not
+    # infer it from names such as "海岛" or from a geography dictionary.
+    explicit_mode = _explicit_cross_sea_mode(raw_text or "")
+    if re.search(r"跨海|跨水|过海|渡海|跨海峡|海上", raw_text or "") or explicit_mode == "ferry":
+        result["cross_sea_required"] = True
+        if explicit_mode:
+            result["cross_sea_mode"] = explicit_mode
+
+    explicit_window = _extract_explicit_time_window(raw_text or "")
+    if explicit_window:
+        result.update(explicit_window)
+
+    actual_relative = list(
+        re.finditer(
+            r"大后天|后天|明天|今天|昨天|前天|the day after tomorrow|"
+            r"day after tomorrow|day before yesterday|tomorrow|today|yesterday",
+            raw_text,
+            re.IGNORECASE,
+        )
+    )
+    if actual_relative:
+        relative_offsets = {
+            **_CHINESE_RELATIVE_DAY_OFFSETS,
+            "the day after tomorrow": 2,
+            "day after tomorrow": 2,
+            "tomorrow": 1,
+            "today": 0,
+            "yesterday": -1,
+            "day before yesterday": -2,
+        }
+        relative_dates = [
+            today + timedelta(days=relative_offsets[item.group(0).casefold()])
+            for item in actual_relative[:2]
+        ]
+        if "start_date" not in result:
+            result["start_date"] = relative_dates[0].isoformat()
+        if len(relative_dates) > 1 and "end_date" not in result:
+            result["end_date"] = relative_dates[1].isoformat()
+
+    relative = list(
+        re.finditer(
+            r"大后天|后天|明天|今天|昨天|前天|the day after tomorrow|day after tomorrow|"
+            r"day before yesterday|tomorrow|today|yesterday",
+            raw_text,
+            re.IGNORECASE,
+        )
+    )
+    if relative:
+        relative_dates = [
+            today + timedelta(days=_RELATIVE_DAY_OFFSETS[item.group(0).casefold()])
+            for item in relative[:2]
+        ]
+        if "start_date" not in result:
+            result["start_date"] = relative_dates[0].isoformat()
+        if len(relative_dates) > 1 and "end_date" not in result:
+            result["end_date"] = relative_dates[1].isoformat()
+
+    weekday_matches = list(_WEEKDAY_PATTERN.finditer(raw_text))
+    chinese_weekday_matches = list(_CHINESE_WEEKDAY_PATTERN.finditer(raw_text))
+    english_weekday_matches = list(_ENGLISH_WEEKDAY_PATTERN.finditer(raw_text))
+    weekday_dates = [
+        *[_weekday_date(match, today) for match in weekday_matches[:2]],
+        *[_chinese_weekday_date(match, today) for match in chinese_weekday_matches[:2]],
+        *[_english_weekday_date(match, today) for match in english_weekday_matches[:2]],
+    ]
+    # ``_WEEKDAY_PATTERN`` predates the explicit Chinese pattern above and
+    # intentionally overlaps it for ordinary 周/星期 expressions.  Collapse
+    # duplicate dates before deciding whether the user supplied a range; an
+    # otherwise identical pair such as “周日” must not become Sunday→next
+    # Sunday and mask a numeric start date in the same sentence.
+    weekday_dates = list(dict.fromkeys(weekday_dates))
+    weekend_requested = bool(
+        re.search(r"周末|本周末|这个周末|this\s+weekend|weekend", raw_text, re.IGNORECASE)
+    )
+    duration_status, _ = _duration_constraint_status(raw_text)
+    duration_days = _extract_duration_days(raw_text)
+    # A value that is explicit but invalid or outside the fallback parser's
+    # safe range must not be silently converted into the default weekend. The
+    # cloud Requirement Agent can still return the exact value (for example
+    # 277); this marker only protects the provider-unavailable path.
+    if duration_status in {"invalid", "out_of_fallback"}:
+        result["_duration_constraint_error"] = duration_status
+    # Dates derived from a weekend/month/holiday phrase are drafts, not hard
+    # user constraints: “下个月找个周末” does not pin a specific weekend and
+    # “国庆节假期” leaves the exact window to the Agent.  The Requirement
+    # Agent may resolve them differently; the caller skips the literal
+    # override for these fields.
+    draft_fields: set[str] = set()
+    month_dates = _next_month_calendar_window(raw_text, today)
+    if duration_status in {"invalid", "out_of_fallback"}:
+        # Keep any literal dates already extracted above, but do not invent a
+        # weekend/month window around an invalid duration.
+        pass
+    elif month_dates:
+        weekday_dates = month_dates
+        draft_fields.update({"start_date", "end_date"})
+    elif weekend_requested:
+        monday = today - timedelta(days=today.weekday())
+        saturday = monday + timedelta(days=5)
+        if saturday < today:
+            saturday += timedelta(days=7)
+        # “周末/周日” is a common shorthand. Prefer the complete weekend
+        # window over a second regex match for 周日 so it cannot become a
+        # Sunday-to-next-Saturday range.
+        weekday_dates = [saturday, saturday + timedelta(days=1)]
+        # A plain “this weekend” is already an explicit two-day calendar
+        # window.  It becomes an inferred draft only when a duration asks us
+        # to extend it beyond Sunday.
+        if duration_days:
+            draft_fields.update({"start_date", "end_date"})
+    if weekday_dates:
+        weekday_dates = weekday_dates[:2]
+        had_numeric_start = "start_date" in result
+        if len(weekday_dates) > 1 and weekday_dates[1] <= weekday_dates[0]:
+            # A bare second weekday in a range belongs after the first one,
+            # including ranges that cross the Sunday/Monday boundary.
+            second = weekday_dates[1]
+            while second <= weekday_dates[0]:
+                second += timedelta(days=7)
+            weekday_dates[1] = second
+        if "start_date" not in result:
+            result["start_date"] = weekday_dates[0].isoformat()
+        if len(weekday_dates) > 1 and "end_date" not in result:
+            result["end_date"] = weekday_dates[1].isoformat()
+        elif had_numeric_start and "end_date" not in result:
+            # A numeric start followed by one weekday (“9月12号……周日回”)
+            # denotes the next occurrence after that start date.
+            try:
+                start_value = date.fromisoformat(str(result["start_date"]))
+                end_value = weekday_dates[0]
+                while end_value <= start_value:
+                    end_value += timedelta(days=7)
+                result["end_date"] = end_value.isoformat()
+            except (TypeError, ValueError):
+                pass
+    # A duration bound such as “最多五天” widens an inferred weekend window
+    # (下个月找个周末，最多五天 → Saturday through the following Wednesday).
+    # It must never shrink an explicit date range, so it only applies when
+    # the start date came from the weekend/month inference above.
+    if (
+        duration_days
+        and "start_date" in result
+        and ("end_date" not in result or "start_date" in draft_fields)
+    ):
+        try:
+            start_value = date.fromisoformat(str(result["start_date"]))
+            result["end_date"] = (start_value + timedelta(days=duration_days - 1)).isoformat()
+            # A duration following an explicit weekday (下周三玩三天) is an
+            # authoritative calendar constraint and must replace stale dates
+            # from a previous preflight.  It is only a draft when the start
+            # itself came from a vague weekend/month choice.
+            if "start_date" in draft_fields:
+                draft_fields.add("end_date")
+        except (TypeError, ValueError):
+            pass
+    # A named holiday such as 国庆节 is a concrete calendar anchor.  The
+    # Requirement Agent resolves the real travel window; this fallback only
+    # answers when the Agent is unavailable.  Lunar holidays (春节/中秋/端午)
+    # are left to the Agent because they cannot be resolved deterministically.
+    holiday_dates = _holiday_window(raw_text, today)
+    if holiday_dates and "start_date" not in result:
+        result["start_date"] = holiday_dates[0].isoformat()
+        draft_fields.add("start_date")
+        if "end_date" not in result:
+            result["end_date"] = holiday_dates[1].isoformat()
+            draft_fields.add("end_date")
+
+    if draft_fields:
+        result["_inferred_date_fields"] = sorted(draft_fields)
+
+    return result
+
+
+def _clean_explicit_place(value: str) -> str | None:
+    value = re.sub(r"\s+", " ", value).strip(" \t\r\n，,。；;、:：")
+    value = re.sub(r"(?:及其周边|周边)$", "", value).strip()
+    value = re.sub(r"(?:早上|上午|中午|下午|晚上|夜间)$", "", value).strip()
+    if not value or len(value) > 64:
+        return None
+    return value
+
+
+def extract_explicit_location_constraints(raw_text: str) -> dict[str, str]:
+    """Recover only explicit origin/destination grammar when the Agent is down.
+
+    The fallback intentionally does not contain a city/POI dictionary and does
+    not infer a destination from an experience (for example, “看流星雨”).
+    It is limited to common travel clauses and is used only for fields the
+    semantic Agent did not return.
+    """
+    text = re.sub(r"\s+", " ", raw_text or "").strip()
+    if not text:
+        return {}
+
+    result: dict[str, str] = {}
+
+    # A very common natural form is “从 A 坐/乘……去 B”.  The previous
+    # fallback only understood “从 A 出发” and therefore missed the origin in
+    # this form.  Keep the recovery grammar transport-agnostic: it looks for a
+    # travel verb between the two places rather than maintaining a city list.
+    transport_origin_match = re.search(
+        r"从\s*(?P<origin>[^，,。；;、]+?)\s*"
+        r"(?=(?:坐|乘坐|乘|搭乘|搭|开车|自驾|骑车|骑行|步行)"
+        r"\s*[^，,。；;、]{0,12}?(?:去|到|前往))",
+        text,
+    )
+    origin_match = transport_origin_match or re.search(
+        r"从\s*(?P<origin>[^，,。；;、]+?)\s*(?:出发|启程|开始(?:行程)?|出游|到)",
+        text,
+    )
+    if origin_match:
+        origin = _clean_explicit_place(origin_match.group("origin"))
+        if origin:
+            result["origin_name"] = origin
+
+    # “去/前往 B 看/玩…” and “在 B 及其周边…” are explicit destination
+    # clauses.  Stop before the experience so it is not mistaken for a POI.
+    destination_patterns = (
+        # Do not treat bare “到” as a destination marker: in “周日到下周三”
+        # it is a date-range connector, not a place.  “去/前往/抵达” are
+        # unambiguous travel clauses here; “玩” also stops “去成都玩三天”
+        # before the duration text.
+        r"(?:去|前往|抵达|游览|参观)\s*(?P<destination>[^，,。；;、]+?)"
+        r"(?=及其周边|周边|看|赏|游玩|玩|旅游|转转|参观|住宿|停留|度假|出游|[，,。；;]|$)",
+        r"在\s*(?P<destination>[^，,。；;、]+?)"
+        r"(?=及其周边|周边|旅游|游玩|转转|住宿|停留|度假|出游|[，,。；;]|$)",
+    )
+    for pattern in destination_patterns:
+        destination_match = re.search(pattern, text)
+        if not destination_match:
+            continue
+        destination = _clean_explicit_place(destination_match.group("destination"))
+        if destination and destination != result.get("origin_name"):
+            result["destination_name"] = destination
+            break
+
+    # Also support concise “从 A 到 B” and English “from A to B” clauses.
+    if "origin_name" not in result or "destination_name" not in result:
+        compact_match = re.search(
+            r"从\s*(?P<origin>[^，,。；;、]+?)\s*到\s*(?P<destination>[^，,。；;、]+?)"
+            r"(?=看|赏|游玩|旅游|转转|及其周边|周边|[，,。；;]|$)",
+            text,
+        )
+        english_match = re.search(
+            r"\bfrom\s+(?P<origin>[^,.;]+?)\s+to\s+(?P<destination>[^,.;]+?)"
+            r"(?=\s+(?:for|with|on)\b|[,.;]|$)",
+            text,
+            re.IGNORECASE,
+        )
+        match = compact_match or english_match
+        if match:
+            origin = _clean_explicit_place(match.group("origin"))
+            destination = _clean_explicit_place(match.group("destination"))
+            if origin and "origin_name" not in result:
+                result["origin_name"] = origin
+            if destination and "destination_name" not in result:
+                result["destination_name"] = destination
+
+    return result
+
+
+def _coerce_optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "是", "需要"}:
+            return True
+        if normalized in {"false", "no", "0", "否", "不需要"}:
+            return False
+    return None
+
+
+def _coerce_positive_minutes(value: Any) -> int | None:
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    return minutes if 1 <= minutes <= 7 * 24 * 60 else None
+
+
+def _coerce_time_window_minutes(value: Any) -> int | None:
+    """Validate an explicit travel window, including a zero-minute conflict."""
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+    return minutes if 0 <= minutes <= 7 * 24 * 60 else None
+
+
+def _normalize_place_name(value: str) -> str:
+    """Normalize whitespace without interpreting place language."""
+    return " ".join(value.split()).strip("，,。；;、")
+
+
+def _normalize_special_events(value: Any) -> list[str]:
+    events = [str(item).strip() for item in value] if isinstance(value, list) else []
+    return list(dict.fromkeys(item for item in events if item))[:8]
+
+
+def _coerce_travelers(value: Any) -> int | None:
+    """Validate the numeric count returned by the Requirement Agent."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, float) and value.is_integer():
+        return int(value) if value >= 1 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        number = int(value.strip())
+        return number if number >= 1 else None
+    return None
+
+
+def _coerce_positive_int(value: Any, *, maximum: int) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= maximum else None
+    if isinstance(value, float) and value.is_integer():
+        integer = int(value)
+        return integer if 1 <= integer <= maximum else None
+    if isinstance(value, str) and value.strip().isdigit():
+        integer = int(value.strip())
+        return integer if 1 <= integer <= maximum else None
+    return None
+
+
+def _normalize_clock(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", value)
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+_CLOCK_LITERAL = (
+    r"(?:(?:凌晨|清晨|早上|上午|中午|下午|傍晚|晚上|夜间)\s*)?"
+    r"\d{1,2}(?:(?::\d{1,2})|(?:点|时)(?:\d{1,2}分?)?)"
+)
+
+
+def _clock_literal_to_minutes(value: str) -> int | None:
+    match = re.fullmatch(
+        r"\s*(?P<period>凌晨|清晨|早上|上午|中午|下午|傍晚|晚上|夜间)?\s*"
+        r"(?P<hour>\d{1,2})(?:(?::(?P<colon_minute>\d{1,2}))|"
+        r"(?:点|时)(?P<cn_minute>\d{1,2})?分?)\s*",
+        value,
+    )
+    if not match:
+        return None
+    hour = int(match.group("hour"))
+    minute = int(match.group("colon_minute") or match.group("cn_minute") or 0)
+    if hour > 23 or minute > 59:
+        return None
+    period = match.group("period") or ""
+    if period in {"下午", "傍晚", "晚上", "中午"} and hour < 12:
+        hour += 12
+    elif period in {"凌晨"} and hour == 12:
+        hour = 0
+    return hour * 60 + minute
+
+
+def _extract_explicit_time_window(raw_text: str) -> dict[str, Any]:
+    """Read an explicit same-leg departure/arrival clock window.
+
+    This is a structural safety check, not a semantic classifier.  It only
+    activates when the text contains two clock literals connected to an
+    explicit departure and arrival phrase, so ordinary times in a day plan do
+    not become a guessed travel constraint.
+    """
+    match = re.search(
+        rf"(?P<start>{_CLOCK_LITERAL})\s*(?:出发|启程|离开)"
+        rf".{{0,32}}?(?:到|抵达|到达)\s*(?P<end>{_CLOCK_LITERAL})",
+        raw_text or "",
+    )
+    if not match:
+        return {}
+    start_minutes = _clock_literal_to_minutes(match.group("start"))
+    end_minutes = _clock_literal_to_minutes(match.group("end"))
+    if start_minutes is None or end_minutes is None:
+        return {}
+    elapsed = end_minutes - start_minutes
+    if elapsed < 0:
+        elapsed += 24 * 60
+    return {
+        "departure_time": f"{start_minutes // 60:02d}:{start_minutes % 60:02d}",
+        "return_time": f"{end_minutes // 60:02d}:{end_minutes % 60:02d}",
+        "time_window_minutes": elapsed,
+    }
+
+
+def _explicit_cross_sea_mode(raw_text: str) -> str | None:
+    """Return a water-crossing mode only when the user explicitly states it."""
+    if re.search(r"轮渡|渡轮|坐船|乘船|船运|ferry|boat|ship", raw_text, re.IGNORECASE):
+        return "ferry"
+    if re.search(r"飞机|航班|飞过去|flight|plane", raw_text, re.IGNORECASE):
+        return "flight"
+    if re.search(r"跨海大桥|大桥通行|bridge", raw_text, re.IGNORECASE):
+        return "bridge"
+    return None
+
+
+# Compatibility symbol retained for callers that import the old helper. The
+# implementation is intentionally Agent-free: only literal dates are kept.
+def deterministic_extract(raw_text: str, today: date) -> dict[str, Any]:
+    return _extract_literal_constraints(raw_text, today)

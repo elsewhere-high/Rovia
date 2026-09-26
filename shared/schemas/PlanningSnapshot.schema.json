@@ -1,0 +1,143 @@
+{
+  "$defs": {
+    "TripStatus": {
+      "enum": [
+        "collecting",
+        "clarification_required",
+        "ready_to_plan",
+        "planning",
+        "paused",
+        "completed",
+        "failed"
+      ],
+      "title": "TripStatus",
+      "type": "string"
+    }
+  },
+  "properties": {
+    "trip_id": {
+      "title": "Trip Id",
+      "type": "string"
+    },
+    "status": {
+      "$ref": "#/$defs/TripStatus"
+    },
+    "missing_fields": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Missing Fields",
+      "type": "array"
+    },
+    "clarification_round": {
+      "default": 0,
+      "title": "Clarification Round",
+      "type": "integer"
+    },
+    "clarification_question": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Clarification Question"
+    },
+    "defaults_applied": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Defaults Applied",
+      "type": "array"
+    },
+    "progress": {
+      "additionalProperties": true,
+      "title": "Progress",
+      "type": "object"
+    },
+    "verification_result": {
+      "anyOf": [
+        {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Verification Result"
+    },
+    "special_event_research": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Special Event Research",
+      "type": "array"
+    },
+    "plan_markdown": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Plan Markdown"
+    },
+    "job_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Job Id"
+    },
+    "planning_batch_id": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Planning Batch Id"
+    },
+    "edit_confirmation_pending": {
+      "default": false,
+      "title": "Edit Confirmation Pending",
+      "type": "boolean"
+    },
+    "route_replan_required": {
+      "default": false,
+      "title": "Route Replan Required",
+      "type": "boolean"
+    },
+    "excluded_places": {
+      "items": {
+        "additionalProperties": true,
+        "type": "object"
+      },
+      "title": "Excluded Places",
+      "type": "array"
+    }
+  },
+  "required": [
+    "trip_id",
+    "status"
+  ],
+  "title": "PlanningSnapshot",
+  "type": "object"
+}

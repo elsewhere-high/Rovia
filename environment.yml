@@ -1,0 +1,10 @@
+name: rovia
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - nodejs=22
+  - redis-server=7.4
+  - pip:
+      - -r backend/requirements.txt

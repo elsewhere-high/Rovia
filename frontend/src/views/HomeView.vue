@@ -1,0 +1,1346 @@
+<script setup lang="ts">
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import {
+  Activity, Bell, ChevronDown, CircleUserRound, CloudSun, Grid2X2, Paperclip,
+  History, LogOut, Mic, Route, Send, Settings, SlidersHorizontal, UserRound, CarFront, Trash2,
+} from '@lucide/vue'
+import {
+  createTrip,
+  deleteTrip,
+  fetchWeatherForecast,
+  listTrips,
+  preflightTrip,
+  reverseGeocodeLocation,
+  startPlanning as startPlanningRequest,
+  type PreflightResult,
+  type SpecialEventResearch,
+} from '../api/trips'
+import {
+  createVehicle,
+  deleteVehicle,
+  listVehicles,
+  updateVehicle,
+  type Vehicle,
+  type VehicleCatalogItem,
+  type VehicleInput,
+  searchVehicleCatalog,
+} from '../api/vehicles'
+import type { Trip } from '../types/trip'
+import { createManagedUser, listManagedUsers, type User as AuthUser } from '../api/auth'
+import { useAuthStore } from '../stores/auth'
+import BrandMark from '../components/BrandMark.vue'
+
+const router = useRouter()
+const auth = useAuthStore()
+const PROMPT_STORAGE_KEY = 'rovia:last-trip-prompt'
+const promptSuggestion = '周六从杭州出发，去安吉住一晚，想走走竹林、喝咖啡，周日傍晚回家'
+const prompt = ref('')
+const promptInput = ref<HTMLTextAreaElement | null>(null)
+function autoResizePrompt() {
+  const el = promptInput.value
+  if (!el) return
+  el.style.height = 'auto'
+  el.style.height = `${el.scrollHeight}px`
+}
+const historyOpen = ref(false)
+const historyTrips = ref<Trip[]>([])
+const historyDeletingId = ref<string | null>(null)
+const historySelectedIds = ref<string[]>([])
+const historyBulkDeleting = ref(false)
+type WeatherState = {
+  temperature: string
+  condition: string
+  location: string
+  source: string
+  status: 'locating' | 'loading' | 'ready' | 'unavailable'
+}
+
+type WeatherCoordinates = {
+  latitude: number
+  longitude: number
+  location: string
+  source: 'browser' | 'remembered'
+}
+
+const WEATHER_LOCATION_STORAGE_KEY = 'rovia:last-weather-location'
+const weather = ref<WeatherState>({
+  temperature: '--',
+  condition: '正在定位',
+  location: '正在获取位置',
+  source: '多源预报',
+  status: 'locating',
+})
+let weatherRequestId = 0
+const activeMenu = ref('账户设置')
+const drawerOpen = ref(false)
+const accountMenuOpen = ref(false)
+const vehicles = ref<Vehicle[]>([])
+const currentVehicleId = ref('')
+const vehicleBusy = ref(false)
+const vehicleError = ref('')
+const vehicleFormOpen = ref(false)
+const vehicleEditingId = ref<string | null>(null)
+const vehicleCatalogQuery = ref('')
+const vehicleCatalogResults = ref<VehicleCatalogItem[]>([])
+const vehicleCatalogBusy = ref(false)
+const vehicleCatalogError = ref('')
+const VEHICLE_STORAGE_KEY = 'rovia:current-vehicle-id'
+const modelEnabled = ref(true)
+const modelLoaded = ref(false)
+const modelError = ref(false)
+const managedUsers = ref<AuthUser[]>([])
+const managedUserEmail = ref('')
+const managedUserDisplayName = ref('')
+const managedUserPassword = ref('')
+const managedUserBusy = ref(false)
+const managedUserError = ref('')
+const managedUserSuccess = ref('')
+// Keep the bundled vehicle preview and its independent provenance notice.
+const modelSource = ref('/models/mclaren.glb')
+const voiceReserved = ref(false)
+const planning = ref(false)
+const preflightChecking = ref(false)
+const planningError = ref('')
+const planningServiceError = ref('')
+const preflight = ref<PreflightResult | null>(null)
+const clarificationAnswers = ref<Record<string, string>>({})
+const clarificationIndex = ref(0)
+const isFirefox = ref(false)
+// Keep the model enabled by default; the render target is bounded by CSS and
+// model-viewer's adaptive scale so the real 3D vehicle remains available
+// without recreating the previous oversized canvas.
+const vehicleMotionAttributes = computed(() => ({}))
+const activeClarification = computed(() => preflight.value?.issues[clarificationIndex.value])
+const allHistorySelected = computed(() =>
+  historyTrips.value.length > 0
+  && historyTrips.value.every((trip) => historySelectedIds.value.includes(trip.id)),
+)
+const currentVehicle = computed(() => vehicles.value.find((vehicle) => vehicle.id === currentVehicleId.value) || vehicles.value[0])
+const currentUserName = computed(() => auth.user?.display_name || auth.user?.email || '驾驶员')
+const currentUserInitial = computed(() => currentUserName.value.slice(0, 1).toUpperCase())
+const availableRange = computed(() => {
+  const vehicle = currentVehicle.value
+  if (!vehicle?.rated_range_km || vehicle.current_energy_percent == null) return 450
+  return Math.max(0, Math.round(vehicle.rated_range_km * vehicle.current_energy_percent / 100))
+})
+
+function catalogSpec(item: VehicleCatalogItem, ...labels: string[]): string | null {
+  const specs = item.specifications || []
+  const match = specs.find((spec) => labels.some((label) => spec.name.includes(label)))
+  return match ? `${match.name} ${match.value}` : null
+}
+
+function catalogSummary(item: VehicleCatalogItem): string {
+  const summary = [
+    item.rated_range_km
+      ? `${item.estimated_fields?.includes('rated_range_km') ? '车型标称续航' : '续航'} ${item.rated_range_km} km`
+      : catalogSpec(item, '续航'),
+    item.consumption_per_100km ? `能耗 ${item.consumption_per_100km}/100km` : catalogSpec(item, '耗电', '油耗'),
+    item.battery_kwh ? `电池 ${item.battery_kwh} kWh` : catalogSpec(item, '电池能量', '电池容量'),
+    item.dc_charge_time_hours ? `直流快充 30-80% ${item.dc_charge_time_hours} h` : catalogSpec(item, '直流快充', 'DC charging', 'Charging time'),
+    item.seats ? `${item.seats} 座` : catalogSpec(item, '车身结构', '座位数'),
+  ].filter(Boolean)
+  return summary.length
+    ? summary.join(' · ')
+    : '该年款详情源暂未返回续航、电池与能耗，选择后需补充确认'
+}
+
+function newVehicleDraft(): VehicleInput {
+  return {
+    brand: 'Rovia',
+    series: '纯电 SUV',
+    model: 'Rovia 纯电 SUV',
+    power_type: 'electric',
+    rated_range_km: 560,
+    current_energy_percent: 80,
+    battery_kwh: 82,
+    consumption_per_100km: 18,
+    max_charge_kw: 180,
+    seats: 5,
+    has_etc: true,
+    mountain_ready: true,
+    unpaved_ready: false,
+    safe_energy_reserve_percent: 15,
+  }
+}
+
+function blankVehicleDraft(): VehicleInput {
+  return {
+    ...newVehicleDraft(),
+    brand: '',
+    series: '',
+    model: '',
+    rated_range_km: undefined,
+    battery_kwh: undefined,
+    consumption_per_100km: undefined,
+    max_charge_kw: undefined,
+    specifications: [],
+  }
+}
+
+const vehicleDraft = ref<VehicleInput>(newVehicleDraft())
+
+const menus = [
+  { label: '账户设置', icon: CircleUserRound },
+  { label: '车型管理/选择', icon: CarFront },
+  { label: '用户设置', icon: UserRound },
+  { label: '系统设置', icon: Settings },
+  { label: '其他设置', icon: Grid2X2 },
+]
+const quickActions = [
+  {
+    icon: '🚙',
+    label: '周末周边轻松游',
+    prompt: '这周六早上从杭州自驾去安吉，两天一夜。想看竹林、逛小镇，住宿舒适一些，沿途留出休息时间，周日晚饭前回杭州。',
+  },
+  {
+    icon: '🏞️',
+    label: '沿途风景慢慢玩',
+    prompt: '下周从杭州自驾去丽水玩三天，想看山水、吃当地菜，顺路安排合适的住宿，晚上不走山路。',
+  },
+  {
+    icon: '⚡',
+    label: '新能源补能安排',
+    prompt: '我开新能源车，周末从杭州去千岛湖玩两天，请结合实际续航安排充电和休息，景点与餐厅附近要方便停车。',
+  },
+  {
+    icon: '🌦️',
+    label: '下雨自动重排',
+    prompt: '周六从杭州自驾去绍兴，如果下雨就把户外游览换成室内，保留吃饭和返程时间，周日晚回杭州。',
+  },
+]
+
+function useQuickPrompt(value: string) {
+  prompt.value = value
+  resetPreflight()
+}
+
+onMounted(() => {
+  prompt.value = window.sessionStorage.getItem(PROMPT_STORAGE_KEY) || ''
+  nextTick(autoResizePrompt)
+  isFirefox.value = /firefox/i.test(navigator.userAgent)
+  void loadHistory()
+  void loadVehicles()
+  void loadHomeWeather()
+  // McLaren uses Draco mesh compression. Keep its decoder inside the frontend
+  // image so the 3D car does not depend on gstatic/CDN availability at runtime.
+  const modelViewerGlobal = window as typeof window & {
+    ModelViewerElement?: { dracoDecoderLocation?: string }
+  }
+  modelViewerGlobal.ModelViewerElement = {
+    ...modelViewerGlobal.ModelViewerElement,
+    dracoDecoderLocation: '/draco/',
+  }
+  void import('@google/model-viewer').then(({ ModelViewerElement }) => {
+    // The model is intentionally loaded, but keep adaptive rendering bounded.
+    // model-viewer clamps this value to a safe minimum of 0.25.
+    ModelViewerElement.minimumRenderScale = 0.25
+  }).catch(() => {
+    modelError.value = true
+  })
+})
+
+async function loadVehicles() {
+  try {
+    let result = await listVehicles()
+    if (!result.length) {
+      // Keep the drawer useful on a new installation while still persisting a
+      // real profile for the planning backend to consume.
+      result = [await createVehicle(newVehicleDraft())]
+    }
+    vehicles.value = result
+    const remembered = window.localStorage.getItem(VEHICLE_STORAGE_KEY)
+    currentVehicleId.value = result.some((vehicle) => vehicle.id === remembered)
+      ? remembered || result[0].id
+      : result[0].id
+    window.localStorage.setItem(VEHICLE_STORAGE_KEY, currentVehicleId.value)
+  } catch (error) {
+    // The home page can still be used when the API is offline; editing will
+    // surface the concrete request error instead of hiding the drawer.
+    vehicles.value = [{ id: 'local-default', ...newVehicleDraft() } as Vehicle]
+    currentVehicleId.value = 'local-default'
+    vehicleError.value = error instanceof Error ? error.message : '车辆列表暂不可用'
+  }
+}
+
+function selectVehicle(vehicleId: string) {
+  currentVehicleId.value = vehicleId
+  window.localStorage.setItem(VEHICLE_STORAGE_KEY, vehicleId)
+}
+
+function beginAddVehicle() {
+  vehicleEditingId.value = null
+  vehicleDraft.value = blankVehicleDraft()
+  vehicleError.value = ''
+  resetVehicleCatalog()
+  vehicleFormOpen.value = true
+}
+
+function beginEditVehicle(vehicle: Vehicle) {
+  // The offline placeholder is not persisted; editing it creates the first
+  // real server profile instead of issuing a PATCH for a synthetic id.
+  vehicleEditingId.value = vehicle.id === 'local-default' ? null : vehicle.id
+  vehicleDraft.value = vehicle.id === 'local-default'
+    ? { ...vehicle, id: undefined }
+    : { ...vehicle }
+  vehicleError.value = ''
+  resetVehicleCatalog()
+  vehicleFormOpen.value = true
+}
+
+function resetVehicleCatalog() {
+  vehicleCatalogQuery.value = ''
+  vehicleCatalogResults.value = []
+  vehicleCatalogBusy.value = false
+  vehicleCatalogError.value = ''
+}
+
+function cancelVehicleForm() {
+  vehicleFormOpen.value = false
+  vehicleEditingId.value = null
+  vehicleDraft.value = newVehicleDraft()
+  resetVehicleCatalog()
+}
+
+async function searchVehicleModels() {
+  const query = vehicleCatalogQuery.value.trim()
+  if (query.length < 2) {
+    vehicleCatalogError.value = '请输入至少两个字符，例如“特斯拉 Model 3”或“比亚迪”'
+    vehicleCatalogResults.value = []
+    return
+  }
+  if (vehicleCatalogBusy.value) return
+  vehicleCatalogBusy.value = true
+  vehicleCatalogError.value = ''
+  try {
+    const result = await searchVehicleCatalog(query)
+    vehicleCatalogResults.value = result.items
+    if (!result.items.length) vehicleCatalogError.value = '没有找到具体车型，请换一个品牌、车系或车型关键词'
+  } catch (error) {
+    vehicleCatalogResults.value = []
+    vehicleCatalogError.value = error instanceof Error ? error.message : '车型数据库暂不可用'
+  } finally {
+    vehicleCatalogBusy.value = false
+  }
+}
+
+function applyVehicleCatalogItem(item: VehicleCatalogItem) {
+  const existing = vehicleDraft.value
+  const editing = Boolean(vehicleEditingId.value)
+  const sameCatalogRecord = editing && existing.source_id === item.source_id
+  vehicleDraft.value = {
+    ...existing,
+    brand: item.brand,
+    series: item.series,
+    model: item.model,
+    year: item.year ?? undefined,
+    power_type: item.power_type,
+    // The catalog does not promise trim-specific technical specs. Preserve
+    // verified values while editing; a new vehicle leaves them blank so the
+    // user cannot mistake a demo SUV's values for this model's values.
+    rated_range_km: item.rated_range_km ?? (sameCatalogRecord ? existing.rated_range_km : undefined),
+    battery_kwh: item.battery_kwh ?? (sameCatalogRecord ? existing.battery_kwh : undefined),
+    consumption_per_100km: item.consumption_per_100km ?? (sameCatalogRecord ? existing.consumption_per_100km : undefined),
+    max_charge_kw: item.max_charge_kw ?? (sameCatalogRecord ? existing.max_charge_kw : undefined),
+    dc_charge_time_hours: item.dc_charge_time_hours ?? (sameCatalogRecord ? existing.dc_charge_time_hours : undefined),
+    height_m: item.height_m ?? (sameCatalogRecord ? existing.height_m : undefined),
+    width_m: item.width_m ?? (sameCatalogRecord ? existing.width_m : undefined),
+    seats: item.seats ?? existing.seats ?? 5,
+    current_energy_percent: item.current_energy_percent ?? existing.current_energy_percent ?? 80,
+    source_id: item.source_id,
+    source_url: item.source_url,
+    detail_source_url: item.detail_source_url,
+    price_min_cny: item.price_min_cny,
+    price_max_cny: item.price_max_cny,
+    specifications: item.specifications || (sameCatalogRecord ? existing.specifications : []) || [],
+  }
+  vehicleCatalogError.value = item.specs_missing?.length
+    ? `已填入 ${item.brand} ${item.model}。${item.specs_missing.join('、')}需按具体配置确认。`
+    : `已填入 ${item.brand} ${item.model}，请确认车辆参数后保存。`
+}
+
+async function addVehicleFromCatalog(item: VehicleCatalogItem) {
+  if (vehicleBusy.value) return
+  applyVehicleCatalogItem(item)
+  await saveVehicle()
+}
+
+async function saveVehicle() {
+  if (vehicleBusy.value) return
+  vehicleBusy.value = true
+  vehicleError.value = ''
+  try {
+    const saved = vehicleEditingId.value
+      ? await updateVehicle(vehicleEditingId.value, vehicleDraft.value)
+      : await createVehicle(vehicleDraft.value)
+    const existingIndex = vehicles.value.findIndex((vehicle) => vehicle.id === saved.id)
+    if (existingIndex >= 0) vehicles.value.splice(existingIndex, 1, saved)
+    else vehicles.value.unshift(saved)
+    selectVehicle(saved.id)
+    cancelVehicleForm()
+  } catch (error) {
+    vehicleError.value = error instanceof Error ? error.message : '保存车辆失败'
+  } finally {
+    vehicleBusy.value = false
+  }
+}
+
+async function removeVehicle(vehicle: Vehicle) {
+  if (vehicleBusy.value || !window.confirm(`确定删除“${vehicle.brand} ${vehicle.model}”吗？`)) return
+  vehicleBusy.value = true
+  vehicleError.value = ''
+  try {
+    if (vehicle.id !== 'local-default') await deleteVehicle(vehicle.id)
+    vehicles.value = vehicles.value.filter((item) => item.id !== vehicle.id)
+    if (!vehicles.value.length) {
+      vehicles.value = [{ id: 'local-default', ...newVehicleDraft() } as Vehicle]
+    }
+    if (currentVehicleId.value === vehicle.id) selectVehicle(vehicles.value[0].id)
+    if (vehicleEditingId.value === vehicle.id) cancelVehicleForm()
+  } catch (error) {
+    vehicleError.value = error instanceof Error ? error.message : '删除车辆失败'
+  } finally {
+    vehicleBusy.value = false
+  }
+}
+
+async function loadHistory() {
+  try {
+    const trips = await listTrips()
+    historyTrips.value = trips
+      .filter((trip) => trip.id !== 'trip_wuhan_lushan_demo')
+      .sort((left, right) => {
+        const leftTime = left.created_at ? Date.parse(left.created_at) : NaN
+        const rightTime = right.created_at ? Date.parse(right.created_at) : NaN
+        if (Number.isFinite(leftTime) && Number.isFinite(rightTime)) return rightTime - leftTime
+        return right.id.localeCompare(left.id)
+      })
+    historySelectedIds.value = historySelectedIds.value.filter((id) => historyTrips.value.some((trip) => trip.id === id))
+  } catch {
+    historyTrips.value = []
+    historySelectedIds.value = []
+  }
+}
+
+function toggleHistorySelection(id: string) {
+  historySelectedIds.value = historySelectedIds.value.includes(id)
+    ? historySelectedIds.value.filter((item) => item !== id)
+    : [...historySelectedIds.value, id]
+}
+
+function toggleSelectAllHistory() {
+  historySelectedIds.value = allHistorySelected.value ? [] : historyTrips.value.map((trip) => trip.id)
+}
+
+async function deleteHistoryIds(ids: string[], confirmation: string) {
+  const uniqueIds = [...new Set(ids)].filter((id) => historyTrips.value.some((trip) => trip.id === id))
+  if (!uniqueIds.length || historyBulkDeleting.value) return
+  if (!window.confirm(confirmation)) return
+  historyBulkDeleting.value = true
+  try {
+    for (const id of uniqueIds) await deleteTrip(id)
+    historySelectedIds.value = historySelectedIds.value.filter((id) => !uniqueIds.includes(id))
+    await loadHistory()
+  } catch {
+    window.alert('批量删除失败，请稍后重试。')
+    await loadHistory()
+  } finally {
+    historyBulkDeleting.value = false
+  }
+}
+
+async function clearSelectedHistory() {
+  await deleteHistoryIds(
+    historySelectedIds.value,
+    `确定删除选中的 ${historySelectedIds.value.length} 条历史规划吗？删除后无法恢复。`,
+  )
+}
+
+async function clearAllHistory() {
+  await deleteHistoryIds(
+    historyTrips.value.map((trip) => trip.id),
+    `确定清空全部 ${historyTrips.value.length} 条历史规划吗？删除后无法恢复。`,
+  )
+}
+
+function weatherCondition(code: number | null | undefined) {
+  if (code === undefined || code === null) return '天气待更新'
+  if ([1, 2, 3].includes(code)) return '多云'
+  if ([45, 48].includes(code)) return '雾'
+  if (code >= 51 && code <= 67) return '小雨'
+  if (code >= 71 && code <= 86) return '降雪'
+  if (code >= 95) return '雷雨'
+  return '晴'
+}
+
+function readRememberedWeatherLocation(): WeatherCoordinates | null {
+  try {
+    const raw = window.localStorage.getItem(WEATHER_LOCATION_STORAGE_KEY)
+    if (!raw) return null
+    const value = JSON.parse(raw) as Partial<WeatherCoordinates>
+    if (
+      typeof value.latitude !== 'number'
+      || typeof value.longitude !== 'number'
+      || !Number.isFinite(value.latitude)
+      || !Number.isFinite(value.longitude)
+    ) return null
+    return {
+      latitude: value.latitude,
+      longitude: value.longitude,
+      location: '上次位置',
+      source: 'remembered',
+    }
+  } catch {
+    return null
+  }
+}
+
+function browserCoordinates(): Promise<WeatherCoordinates | null> {
+  const remembered = readRememberedWeatherLocation()
+  if (typeof navigator === 'undefined' || !navigator.geolocation) {
+    return Promise.resolve(remembered)
+  }
+
+  // Browser permission prompts and cold-start GPS fixes regularly take more
+  // than a second.  The previous 1.2s/1.4s timeout made every slow but valid
+  // location silently fall back to a hard-coded Wuhan coordinate.  Keep a
+  // bounded wait, but allow the browser enough time to return the approved
+  // position; a remembered position is only used if the request really fails.
+  return new Promise<WeatherCoordinates | null>((resolve) => {
+    let settled = false
+    const finish = (value: WeatherCoordinates | null) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    const timer = window.setTimeout(() => finish(remembered), 15_000)
+    try {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          window.clearTimeout(timer)
+          const coordinates: WeatherCoordinates = {
+            latitude: position.coords.latitude,
+            longitude: position.coords.longitude,
+            location: '当前位置',
+            source: 'browser',
+          }
+          try {
+            window.localStorage.setItem(
+              WEATHER_LOCATION_STORAGE_KEY,
+              JSON.stringify({ latitude: coordinates.latitude, longitude: coordinates.longitude }),
+            )
+          } catch {
+            // Storage can be disabled in private browsing; the live result is
+            // still useful and should not be discarded.
+          }
+          finish(coordinates)
+        },
+        () => {
+          window.clearTimeout(timer)
+          finish(remembered)
+        },
+        { enableHighAccuracy: false, maximumAge: 5 * 60 * 1000, timeout: 12_000 },
+      )
+    } catch {
+      window.clearTimeout(timer)
+      finish(remembered)
+    }
+  })
+}
+
+async function loadHomeWeather() {
+  const requestId = ++weatherRequestId
+  weather.value = {
+    temperature: '--',
+    condition: '正在定位',
+    location: '正在获取位置',
+    source: '多源预报',
+    status: 'locating',
+  }
+  const coordinates = await browserCoordinates()
+  if (requestId !== weatherRequestId) return
+  if (!coordinates) {
+    weather.value = {
+      temperature: '--',
+      condition: '天气待更新',
+      location: '位置未获取',
+      source: '多源预报',
+      status: 'unavailable',
+    }
+    return
+  }
+
+  weather.value = {
+    temperature: '--',
+    condition: '天气加载中',
+    location: coordinates.location,
+    source: '多源预报',
+    status: 'loading',
+  }
+  try {
+    const labelPromise = coordinates.source === 'browser'
+      ? reverseGeocodeLocation(coordinates.latitude, coordinates.longitude).catch(() => null)
+      : Promise.resolve(null)
+    // Do not wait for reverse geocoding before painting the weather value. A
+    // slow map service should not make a healthy weather response look stuck.
+    const result = await fetchWeatherForecast(coordinates.latitude, coordinates.longitude)
+    const current = result.data?.current
+    if (!result.success || !current) throw new Error('weather response is incomplete')
+    const temperature = current.temperature_2m
+    const code = current.weather_code
+    const condition = typeof code === 'number'
+      ? weatherCondition(code)
+      : String(current.weather_description || '天气待更新')
+    const sourceCount = Number(result.data?.source_count || 0)
+    if (requestId !== weatherRequestId) return
+    weather.value = {
+      temperature: typeof temperature === 'number' ? String(Math.round(temperature)) : '--',
+      condition,
+      location: coordinates.location,
+      source: sourceCount > 1 ? `多源预报 · ${sourceCount}源` : '备用预报',
+      status: 'ready',
+    }
+    void labelPromise.then((labelResult) => {
+      if (
+        requestId !== weatherRequestId
+        || weather.value.status !== 'ready'
+        || !labelResult?.success
+      ) return
+      const location = String(
+        labelResult.data?.label
+        || labelResult.data?.city
+        || labelResult.data?.district
+        || coordinates.location,
+      )
+      weather.value = { ...weather.value, location }
+    }).catch(() => undefined)
+  } catch {
+    if (requestId !== weatherRequestId) return
+    weather.value = {
+      temperature: '--',
+      condition: '天气待更新',
+      location: coordinates.location,
+      source: '多源预报',
+      status: 'unavailable',
+    }
+  }
+}
+
+function openHistoryTrip(trip: Trip) {
+  historyOpen.value = false
+  const historyQuery = 'history=1'
+  if (trip.status === 'collecting' || trip.status === 'planning') {
+    router.push(`/trips/${trip.id}/plan?planning=1&${historyQuery}`)
+  } else {
+    router.push(`/trips/${trip.id}/plan?${historyQuery}`)
+  }
+}
+
+async function removeHistoryTrip(trip: Trip) {
+  if (historyBulkDeleting.value) return
+  if (!window.confirm(`确定删除“${trip.title}”吗？删除后无法从历史规划恢复。`)) return
+  historyDeletingId.value = trip.id
+  try {
+    await deleteTrip(trip.id)
+    // Re-read the server list so a stale client cache or a failed transaction
+    // cannot make a deleted row look gone when it still exists remotely.
+    await loadHistory()
+    if (historyTrips.value.some((item) => item.id === trip.id)) {
+      throw new Error('服务器仍返回这条历史规划')
+    }
+  } catch {
+    window.alert('删除失败，请稍后重试。')
+  } finally {
+    historyDeletingId.value = null
+  }
+}
+
+watch(prompt, (value) => {
+  if (typeof window === 'undefined') return
+  if (value.trim()) window.sessionStorage.setItem(PROMPT_STORAGE_KEY, value)
+  else window.sessionStorage.removeItem(PROMPT_STORAGE_KEY)
+})
+
+function handleModelLoad(event: Event) {
+  modelLoaded.value = true
+  const viewer = event.currentTarget as HTMLElement
+  const canvas = viewer.shadowRoot?.querySelector('canvas')
+  canvas?.addEventListener('webglcontextlost', (contextEvent) => {
+    contextEvent.preventDefault()
+    modelLoaded.value = false
+    modelError.value = true
+    modelEnabled.value = false
+  }, { once: true })
+}
+
+function issueKey(issue: PreflightResult['issues'][number]) {
+  return `${issue.code}:${issue.field || ''}`
+}
+
+function formatEventDate(value?: string): string {
+  const match = value?.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  return match ? `${match[1]} 年 ${Number(match[2])} 月 ${Number(match[3])} 日` : (value || '')
+}
+
+function eventWindowText(item: SpecialEventResearch): string {
+  const facts = item.facts
+  if (facts?.peak_start_date) {
+    const start = formatEventDate(facts.peak_start_date)
+    const end = facts.peak_end_date && facts.peak_end_date !== facts.peak_start_date
+      ? formatEventDate(facts.peak_end_date)
+      : ''
+    return end ? `${start} 至 ${end}` : start
+  }
+  return facts?.active_period || facts?.observation_window_local || ''
+}
+
+function eventEvidenceSources(item: SpecialEventResearch) {
+  const sources = item.sources || []
+  const evidenceIndexes = item.facts?.evidence_source_indexes || []
+  const prioritized = [
+    ...evidenceIndexes.map((index) => sources[index]).filter(Boolean),
+    ...sources,
+  ]
+  return prioritized.filter((source): source is NonNullable<typeof source> => Boolean(source)).filter((source, index, all) =>
+    all.findIndex((candidate) => (candidate.url || candidate.title) === (source.url || source.title)) === index,
+  ).slice(0, 3)
+}
+
+function eventConfidenceLabel(value?: string): string {
+  return value === 'high' ? '多来源高度一致' : value === 'medium' ? '来源基本一致' : '单一来源，建议复核'
+}
+
+function resetPreflight() {
+  preflight.value = null
+  clarificationAnswers.value = {}
+  clarificationIndex.value = 0
+  planningError.value = ''
+  planningServiceError.value = ''
+}
+
+async function checkPreflight(
+  confirmed = false,
+  answersOverride?: Record<string, string>,
+) {
+  if (planning.value || preflightChecking.value || !prompt.value.trim()) return
+  planningError.value = ''
+  try {
+    preflightChecking.value = true
+    // Snapshot the answers before awaiting the network request.  A cloud
+    // extraction round can resolve quickly enough to update the panel while
+    // the user is still on the same question; passing a stable copy prevents
+    // that render from dropping the answer that triggered this check.
+    const answers = { ...(answersOverride ?? clarificationAnswers.value) }
+    preflight.value = await preflightTrip(
+      prompt.value.trim(),
+      answers,
+      confirmed,
+      preflight.value?.extracted,
+      preflight.value?.semantic_checked,
+    )
+    clarificationIndex.value = 0
+    if (!preflight.value.ready) return
+    planning.value = true
+    const trip = await createTrip(
+      prompt.value.trim(),
+      preflight.value.extracted,
+      currentVehicleId.value && currentVehicleId.value !== 'local-default' ? currentVehicleId.value : undefined,
+    )
+    await startPlanningRequest(trip.id)
+    await router.push(`/trips/${trip.id}/plan?planning=1`)
+  } catch (error) {
+    planningServiceError.value = error instanceof Error ? error.message : '规划服务暂不可用'
+  } finally {
+    preflightChecking.value = false
+    planning.value = false
+  }
+}
+
+async function startPlanning() {
+  await checkPreflight(false)
+}
+
+async function submitClarification() {
+  const issue = activeClarification.value
+  if (!issue) return
+  const key = issueKey(issue)
+  const answer = clarificationAnswers.value[key]?.trim() || ''
+  if (!answer) {
+    planningError.value = '请先回答当前问题。'
+    return
+  }
+  planningError.value = ''
+  if (clarificationIndex.value < (preflight.value?.issues.length ?? 1) - 1) {
+    clarificationIndex.value += 1
+    return
+  }
+  await checkPreflight(false, {
+    ...clarificationAnswers.value,
+    [key]: answer,
+  })
+}
+
+async function confirmAndPlan() {
+  await checkPreflight(true)
+}
+
+function activate(label: string) {
+  activeMenu.value = label
+  accountMenuOpen.value = false
+  drawerOpen.value = true
+  if (label === '用户设置') void loadManagedUsers()
+}
+
+async function loadManagedUsers() {
+  if (!auth.isAdmin) return
+  managedUserError.value = ''
+  try {
+    managedUsers.value = await listManagedUsers()
+  } catch (reason) {
+    managedUserError.value = reason instanceof Error ? reason.message : '用户列表加载失败'
+  }
+}
+
+async function createUser() {
+  if (managedUserBusy.value) return
+  managedUserError.value = ''
+  managedUserSuccess.value = ''
+  managedUserBusy.value = true
+  try {
+    const created = await createManagedUser({
+      email: managedUserEmail.value,
+      display_name: managedUserDisplayName.value,
+      password: managedUserPassword.value,
+    })
+    managedUsers.value = [...managedUsers.value, created]
+    managedUserEmail.value = ''
+    managedUserDisplayName.value = ''
+    managedUserPassword.value = ''
+    managedUserSuccess.value = `已创建 ${created.display_name}`
+  } catch (reason) {
+    managedUserError.value = reason instanceof Error ? reason.message : '创建用户失败'
+  } finally {
+    managedUserBusy.value = false
+  }
+}
+
+async function signOut() {
+  await auth.signOut()
+  await router.replace('/login')
+}
+</script>
+
+<template>
+  <main class="home-shell" :class="{ 'home-confirming': Boolean(preflight && !preflight.ready) }">
+    <div class="rovia-masthead"><BrandMark /><span>路线有据，出发有数。</span></div>
+    <header class="home-top glass-card">
+      <button class="profile" aria-label="打开账户菜单" @click="accountMenuOpen = !accountMenuOpen">
+        <div class="avatar">{{ currentUserInitial }}</div>
+        <div>
+          <span class="eyebrow">旅程工作台</span>
+          <strong>您好，{{ currentUserName }}！</strong>
+        </div>
+        <ChevronDown :size="20" :class="{ rotated: accountMenuOpen }" />
+      </button>
+      <div class="top-stats">
+        <span
+          class="weather-status"
+          role="button"
+          tabindex="0"
+          :title="weather.status === 'ready' ? '点击重新获取当前位置天气' : '点击重试定位与天气'"
+          @click="loadHomeWeather"
+          @keydown.enter.prevent="loadHomeWeather"
+          @keydown.space.prevent="loadHomeWeather"
+        ><CloudSun class="sun-icon" /> {{ weather.temperature }}°C&nbsp; {{ weather.condition }} <small>{{ weather.location }} · {{ weather.source }}</small></span>
+        <span><CarFront class="mint-icon" /> <strong>{{ availableRange }}</strong> km <small>估算可用</small></span>
+        <button
+          class="ops-entry-button"
+          type="button"
+          aria-label="打开运行监控"
+          title="运行监控"
+          @click="router.push('/ops')"
+        >
+          <Activity :size="20" />
+          <span>运行监控</span>
+        </button>
+        <button class="history-button" type="button" @click="historyOpen = !historyOpen">
+          <History :size="20" />历史规划<span>{{ historyTrips.length }}</span>
+        </button>
+        <button class="icon-button notification" aria-label="通知"><Bell /><i /></button>
+      </div>
+    </header>
+
+    <Transition name="menu">
+      <aside v-if="historyOpen" class="history-popover glass-card" aria-label="历史规划">
+        <header>
+          <strong>历史规划</strong>
+          <div class="history-header-actions">
+            <button type="button" @click="loadHistory">刷新</button>
+            <button
+              type="button"
+              :disabled="!historyTrips.length || historyBulkDeleting"
+              @click="clearAllHistory"
+            >清空全部</button>
+          </div>
+        </header>
+        <div v-if="historyTrips.length" class="history-bulk-actions">
+          <button type="button" @click="toggleSelectAllHistory">
+            {{ allHistorySelected ? '取消全选' : '全选' }}
+          </button>
+          <button
+            type="button"
+            :disabled="!historySelectedIds.length || historyBulkDeleting"
+            @click="clearSelectedHistory"
+          >删除选中{{ historySelectedIds.length ? `（${historySelectedIds.length}）` : '' }}</button>
+        </div>
+        <p v-if="!historyTrips.length" class="history-empty">还没有保存的规划，完成一次规划后会自动保存在这里。</p>
+        <div
+          v-for="trip in historyTrips"
+          :key="trip.id"
+          :class="['history-item', { selected: historySelectedIds.includes(trip.id) }]"
+          role="button"
+          tabindex="0"
+          @click="openHistoryTrip(trip)"
+          @keydown.enter="openHistoryTrip(trip)"
+        >
+          <input
+            class="history-select"
+            type="checkbox"
+            :checked="historySelectedIds.includes(trip.id)"
+            :disabled="historyBulkDeleting"
+            :aria-label="`选择历史规划：${trip.title}`"
+            @click.stop
+            @change="toggleHistorySelection(trip.id)"
+          >
+          <span class="history-item-main">
+            <strong>{{ trip.title }}</strong>
+            <span>{{ trip.status === 'completed' ? '规划完成' : trip.status === 'planning' ? '正在规划' : '待继续' }} · {{ trip.days.length }} 天</span>
+          </span>
+          <span class="history-item-actions">
+            <button
+              type="button"
+              aria-label="删除历史规划"
+              title="删除"
+              :disabled="historyDeletingId === trip.id || historyBulkDeleting"
+              :aria-busy="historyDeletingId === trip.id || historyBulkDeleting"
+              @click.stop="removeHistoryTrip(trip)"
+            ><Trash2 :size="15" /></button>
+          </span>
+        </div>
+      </aside>
+    </Transition>
+
+    <Transition name="menu">
+      <nav v-if="accountMenuOpen" class="account-dropdown glass-card" aria-label="账户菜单">
+        <button
+          v-for="menu in menus"
+          :key="menu.label"
+          :class="{ active: activeMenu === menu.label }"
+          @click="activate(menu.label)"
+        >
+          <component :is="menu.icon" :size="20" />
+          {{ menu.label }}
+        </button>
+        <button class="account-logout" type="button" @click="signOut"><LogOut :size="17" />退出登录</button>
+      </nav>
+    </Transition>
+
+    <section class="home-content">
+      <div class="rovia-stage-caption"><span>下一程，向喜欢的方向</span><small>拖动车辆旋转 · 滚轮缩放</small></div>
+      <div class="vehicle-stage">
+        <component
+          v-if="modelEnabled"
+          :is="'model-viewer'"
+          class="vehicle-model"
+          :class="{ loaded: modelLoaded }"
+           :src="modelSource"
+          alt="可旋转的 Rovia 3D 车辆模型"
+          camera-controls
+          v-bind="vehicleMotionAttributes"
+          camera-orbit="35deg 70deg 85%"
+          min-camera-orbit="auto auto 60%"
+          max-camera-orbit="auto auto 260%"
+          field-of-view="28deg"
+          min-field-of-view="26deg"
+          max-field-of-view="38deg"
+          :shadow-intensity="0.3"
+          shadow-softness="0.85"
+          :exposure="0.85"
+          interaction-prompt="none"
+          @load="handleModelLoad"
+          @error="modelError = true; modelEnabled = false"
+        />
+        <div v-if="modelEnabled && !modelLoaded && !modelError" class="vehicle-loading" role="status">
+          <i />
+          <span>正在加载车辆模型…</span>
+        </div>
+        <div v-else-if="modelError" class="vehicle-loading error" role="status">
+          <span>车辆模型渲染失败，已暂停渲染以保护显卡</span>
+          <button type="button" class="secondary-button" @click="modelError = false; modelLoaded = false; modelEnabled = true">重新加载车辆模型</button>
+        </div>
+        <span class="sr-only">{{ modelLoaded ? '3D 模型已加载' : modelError ? '3D 模型加载失败' : '正在加载 3D 模型' }}</span>
+      </div>
+    </section>
+
+    <section class="planner-area">
+      <div class="section-title">
+        <span>ROVIA · 下一程</span>
+        <h1>自驾游规划，<em>从想去的地方开始</em></h1>
+      </div>
+      <section
+        v-if="preflight && !preflight.ready"
+        class="preflight-panel glass-card"
+        role="dialog"
+        aria-modal="false"
+        aria-live="polite"
+        aria-label="规划前需求确认"
+      >
+        <template v-if="activeClarification">
+          <div class="preflight-heading">
+          <span>智能体需要向您确认</span>
+            <b>{{ clarificationIndex + 1 }} / {{ preflight.issues.length }}</b>
+          </div>
+          <strong>{{ activeClarification.message }}</strong>
+          <p>回答后会重新检查全部条件；所有问题解决前不会开始规划。</p>
+          <div v-if="activeClarification.answer_type === 'choice'" class="preflight-options">
+            <button
+              v-for="option in activeClarification.options"
+              :key="option"
+              :class="{ selected: clarificationAnswers[issueKey(activeClarification)] === option }"
+              @click="clarificationAnswers[issueKey(activeClarification)] = option"
+            >
+              {{ option }}
+            </button>
+          </div>
+          <input
+            v-else
+            v-model="clarificationAnswers[issueKey(activeClarification)]"
+            class="preflight-answer"
+            :type="activeClarification.answer_type === 'date' ? 'date' : 'text'"
+            :placeholder="activeClarification.answer_type === 'time'
+              ? '例如：取消原到达限制，按合理车程安排'
+              : '请输入修正或补充信息'"
+            @keyup.enter="submitClarification"
+          />
+          <div class="preflight-actions">
+            <button
+              class="secondary-button"
+              :disabled="clarificationIndex === 0"
+              @click="clarificationIndex -= 1"
+            >
+              上一个
+            </button>
+            <button class="primary-button" :disabled="preflightChecking" @click="submitClarification">
+              {{ clarificationIndex < preflight.issues.length - 1 ? '下一个问题' : '重新检查全部条件' }}
+            </button>
+          </div>
+        </template>
+        <template v-else-if="preflight.confirmation_required">
+          <div class="preflight-heading">
+            <span>最终确认</span>
+            <b>检查通过</b>
+          </div>
+          <strong>请确认以下需求，确认后才会开始规划</strong>
+          <dl class="preflight-summary">
+            <div>
+              <dt>路线</dt>
+              <dd>
+                {{ preflight.summary.origin_name }} →
+                {{ preflight.summary.destination_names?.length
+                  ? preflight.summary.destination_names.join('、')
+                  : preflight.summary.destination_name }}
+              </dd>
+            </div>
+            <div v-if="preflight.summary.destination_scope && preflight.summary.destination_scope !== 'unknown'"><dt>目的地范围</dt><dd>{{ preflight.summary.destination_scope === 'province' ? '省域策划' : preflight.summary.destination_scope === 'city' ? '城市策划' : preflight.summary.destination_scope === 'multi_destination' ? '多目的地策划' : '地点策划' }}</dd></div>
+            <div v-if="preflight.summary.travel_intents?.length"><dt>出行目的</dt><dd>{{ preflight.summary.travel_intents.join('、') }}</dd></div>
+            <div><dt>日期</dt><dd>{{ preflight.summary.start_date }} 至 {{ preflight.summary.end_date }}</dd></div>
+            <div><dt>人数</dt><dd>{{ preflight.summary.travelers ?? '待确认' }}{{ preflight.summary.travelers ? ' 人' : '' }}</dd></div>
+            <div v-if="preflight.summary.max_days"><dt>行程上限</dt><dd>最多 {{ preflight.summary.max_days }} 天</dd></div>
+            <div v-if="preflight.summary.clarifications?.length">
+              <dt>已确认</dt><dd>{{ preflight.summary.clarifications.join('；') }}</dd>
+            </div>
+          </dl>
+          <div v-if="preflight.warnings?.length" class="preflight-notices" role="status">
+            <strong>规划耗时提示</strong>
+            <p v-for="warning in preflight.warnings" :key="warning">{{ warning }}</p>
+          </div>
+          <div class="preflight-actions">
+            <button class="secondary-button" @click="resetPreflight">返回修改</button>
+            <button class="primary-button" :disabled="preflightChecking || planning" @click="confirmAndPlan">
+              确认无误，开始规划
+            </button>
+          </div>
+        </template>
+        <template v-else>
+          <div class="preflight-heading">
+            <span>检查结果需要刷新</span>
+            <b>可恢复</b>
+          </div>
+          <strong>没有收到需要补充的具体问题，请重新检查一次。</strong>
+          <p>这不会创建行程，也不会丢失输入内容。</p>
+          <div class="preflight-actions">
+            <button class="secondary-button" @click="resetPreflight">返回修改</button>
+            <button class="primary-button" :disabled="preflightChecking" @click="checkPreflight(false)">
+              重新检查
+            </button>
+            </div>
+          </template>
+          <section v-if="preflight.special_event_research?.length" class="preflight-event-research" aria-label="特殊活动检索结果">
+            <header><strong>智能体已核对特殊活动</strong><small>以下时间来自公开资料，可据此补充行程日期</small></header>
+            <article v-for="item in preflight.special_event_research" :key="item.event">
+              <div class="event-title-row">
+                <strong>{{ item.event }}</strong>
+                <small v-if="item.facts?.confidence">{{ eventConfidenceLabel(item.facts.confidence) }}</small>
+              </div>
+              <div class="event-window" :class="{ unavailable: !eventWindowText(item) }">
+                <small>{{ eventWindowText(item) ? '资料给出的核心日期窗口' : '尚无可核验的具体日期' }}</small>
+                <b>{{ eventWindowText(item) || '当前来源只有活动介绍，请打开下方来源确认时间' }}</b>
+              </div>
+              <div class="event-fact-tags">
+                <span v-if="item.facts?.active_period">活动期：{{ item.facts.active_period }}</span>
+                <span v-if="item.facts?.peak_time_local">极大时刻：北京时间 {{ item.facts.peak_time_local }}</span>
+                <span v-else-if="item.facts?.peak_time_utc">极大时刻：UTC {{ item.facts.peak_time_utc }}</span>
+                <span v-else-if="item.facts?.peak_time_label">来源时间：{{ item.facts.peak_time_label }}</span>
+                <span v-if="item.facts?.observation_window_local">建议观测：{{ item.facts.observation_window_local }}</span>
+                <span v-if="item.facts?.zhr != null">参考天顶流量：每小时约 {{ item.facts.zhr }} 颗</span>
+              </div>
+              <p v-if="item.facts?.summary" class="event-summary">{{ item.facts.summary }}</p>
+              <p v-else class="event-summary">暂未从摘要中提取出足够明确的时间；下面展示检索原文，不再只显示“已找到资料”。</p>
+              <div v-if="eventEvidenceSources(item).length" class="event-source-list">
+                <div v-for="(source, index) in eventEvidenceSources(item)" :key="source.url || source.title || index" class="event-source">
+                  <a v-if="source.url" :href="source.url" target="_blank" rel="noreferrer">{{ source.title || `公开来源 ${index + 1}` }}</a>
+                  <strong v-else>{{ source.title || `公开来源 ${index + 1}` }}</strong>
+                  <p v-if="source.snippet">{{ source.snippet }}</p>
+                </div>
+              </div>
+              <a v-if="item.search_url" class="event-search-link" :href="item.search_url" target="_blank" rel="noreferrer">查看完整检索结果</a>
+            </article>
+          </section>
+       </section>
+      <div class="planner-box glass-card">
+        <div class="agent-orb">AI</div>
+        <div class="prompt-wrap">
+          <label for="trip-prompt">想去哪，想怎样度过这几天？</label>
+          <div class="prompt-composer">
+            <textarea
+              id="trip-prompt"
+              ref="promptInput"
+              v-model="prompt"
+              rows="1"
+              @input="resetPreflight; autoResizePrompt()"
+              @keydown.enter.exact.prevent="startPlanning"
+              aria-label="旅行需求"
+            ></textarea>
+            <div class="composer-actions">
+              <button class="composer-icon" aria-label="添加附件" title="添加附件（暂不可用）">
+                <Paperclip />
+              </button>
+              <button
+                class="composer-icon"
+                :class="{ active: voiceReserved }"
+                :aria-pressed="voiceReserved"
+                aria-label="语音输入"
+                title="语音输入（暂不可用）"
+                @click="voiceReserved = !voiceReserved"
+              >
+                <Mic />
+              </button>
+              <button
+                class="primary-button"
+                :disabled="planning || preflightChecking || !prompt.trim() || Boolean(preflight && !preflight.ready)"
+                @click="startPlanning"
+              >
+                <Send :size="20" />
+                {{ planning ? '正在启动…' : preflightChecking ? '正在检查…' : preflight && !preflight.ready ? '请先完成确认' : '开始规划' }}
+              </button>
+            </div>
+          </div>
+          <div v-if="!prompt.trim()" class="prompt-suggestion">
+            <span>可以这样描述你的出行时间、目的地、同行人和偏好：</span>
+            <button type="button" @click="prompt = promptSuggestion">使用示例</button>
+            <em>{{ promptSuggestion }}</em>
+          </div>
+        </div>
+      </div>
+
+      <div class="quick-grid">
+        <button
+          v-for="item in quickActions"
+          :key="item.label"
+          type="button"
+          :title="item.prompt"
+          @click="useQuickPrompt(item.prompt)"
+        >
+          <span>{{ item.icon }}</span>{{ item.label }}<Route :size="17" />
+        </button>
+      </div>
+    </section>
+
+    <Transition name="failure-modal">
+      <div
+        v-if="planningServiceError"
+        class="failure-dialog-backdrop"
+        role="presentation"
+        @click.self="planningServiceError = ''"
+      >
+        <section class="failure-dialog glass-card" role="alertdialog" aria-modal="true" aria-labelledby="home-failure-title">
+          <div class="failure-dialog-icon" aria-hidden="true">!</div>
+          <div>
+            <span class="failure-dialog-kicker">暂时无法开始规划</span>
+            <h2 id="home-failure-title">需求还需要调整</h2>
+            <p>{{ planningServiceError }}</p>
+            <div class="failure-dialog-hint">保留你的原始输入，你可以关闭提示后补充时间、目的地或交通方式。</div>
+          </div>
+          <div class="failure-dialog-actions">
+            <button class="secondary-button" @click="planningServiceError = ''">返回修改</button>
+            <button class="primary-button" @click="planningServiceError = ''; checkPreflight(false)">重新检查</button>
+          </div>
+        </section>
+      </div>
+    </Transition>
+
+    <Transition name="drawer">
+      <aside v-if="drawerOpen" class="vehicle-drawer glass-card">
+        <button class="drawer-close" @click="drawerOpen = false">×</button>
+        <SlidersHorizontal :size="22" />
+        <h2>{{ activeMenu }}</h2>
+        <template v-if="activeMenu === '车型管理/选择'">
+          <div class="vehicle-drawer-heading">
+            <span class="status-pill">当前车辆</span>
+            <button type="button" class="text-button" @click="beginAddVehicle">添加车型</button>
+          </div>
+          <p v-if="vehicleError" class="vehicle-error">{{ vehicleError }}</p>
+          <div class="vehicle-list">
+            <article
+              v-for="vehicle in vehicles"
+              :key="vehicle.id"
+              :class="['vehicle-item', { selected: vehicle.id === currentVehicle?.id }]"
+              @click="selectVehicle(vehicle.id)"
+            >
+              <button type="button" class="vehicle-item-main" @click.stop="selectVehicle(vehicle.id)">
+                <strong>{{ vehicle.brand }} {{ vehicle.model }}</strong>
+                <small>{{ vehicle.power_type === 'electric' ? '纯电' : vehicle.power_type === 'hybrid' ? '混动' : '燃油' }} · {{ vehicle.seats }} 座</small>
+              </button>
+              <div class="vehicle-item-actions">
+                <button type="button" title="编辑车型" @click.stop="beginEditVehicle(vehicle)">编辑</button>
+                <button type="button" title="删除车型" @click.stop="removeVehicle(vehicle)">删除</button>
+              </div>
+            </article>
+          </div>
+          <template v-if="currentVehicle">
+            <h3>{{ currentVehicle.brand }} {{ currentVehicle.model }}</h3>
+            <dl>
+              <div><dt>额定续航</dt><dd>{{ currentVehicle.rated_range_km || '--' }} km</dd></div>
+              <div><dt>当前电量</dt><dd>{{ currentVehicle.current_energy_percent ?? '--' }}%</dd></div>
+              <div><dt>估算可用</dt><dd>{{ availableRange }} km</dd></div>
+              <div><dt>座位数</dt><dd>{{ currentVehicle.seats }}</dd></div>
+            </dl>
+            <div v-if="currentVehicle.specifications?.length" class="vehicle-specifications" aria-label="已获取的车型参数">
+              <span v-for="spec in currentVehicle.specifications.slice(0, 12)" :key="`${spec.name}-${spec.value}`">
+                {{ spec.name }}：{{ spec.value }}
+              </span>
+            </div>
+          </template>
+          <form v-if="vehicleFormOpen" class="vehicle-form" @submit.prevent="saveVehicle">
+            <strong>{{ vehicleEditingId ? '编辑车型' : '添加车型' }}</strong>
+            <section class="vehicle-catalog" aria-label="车型数据库搜索">
+              <div class="vehicle-catalog-head">
+                <strong>一键搜索具体车型</strong>
+                <small>车型资料智能体 · 汽车品牌/车系/年款数据库</small>
+              </div>
+              <div class="vehicle-catalog-search-row">
+                <input
+                  v-model="vehicleCatalogQuery"
+                  type="search"
+                  placeholder="搜索品牌、车系或具体车型，例如 特斯拉 Model 3"
+                  aria-label="搜索具体车型"
+                  @keydown.enter.prevent="searchVehicleModels"
+                >
+                <button type="button" :disabled="vehicleCatalogBusy" @click="searchVehicleModels">
+                  {{ vehicleCatalogBusy ? '查询中…' : '搜索' }}
+                </button>
+              </div>
+              <small class="vehicle-catalog-note">选择结果会自动填入品牌、车系、动力和年款；续航、能耗等配置以你的具体版本为准。</small>
+              <div v-if="vehicleCatalogResults.length" class="vehicle-catalog-results-head">
+                <span>找到 {{ vehicleCatalogResults.length }} 个具体年款</span>
+                <small>在下方区域滚动查看更多</small>
+              </div>
+              <div
+                v-if="vehicleCatalogResults.length"
+                class="vehicle-catalog-results"
+                role="listbox"
+                tabindex="0"
+                aria-label="车型搜索结果，可上下滚动"
+              >
+                <div
+                  v-for="item in vehicleCatalogResults"
+                  :key="item.id"
+                  class="vehicle-catalog-result"
+                >
+                  <button type="button" class="vehicle-catalog-result-main" @click="applyVehicleCatalogItem(item)">
+                    <span>
+                    <strong>{{ item.brand }} · {{ item.series }}</strong>
+                    <small>{{ item.model }} · {{ item.year || '年款待核实' }} · {{ item.state_label || '状态待核实' }}</small>
+                    <small class="vehicle-catalog-specs">{{ catalogSummary(item) }}</small>
+                    <small v-if="item.catalog_source" class="vehicle-catalog-source">资料：{{ item.catalog_source }}</small>
+                    </span>
+                    <em>填入</em>
+                  </button>
+                  <button type="button" class="vehicle-catalog-result-add" :disabled="vehicleBusy" @click="addVehicleFromCatalog(item)">
+                    {{ vehicleEditingId ? '更新' : '直接添加' }}
+                  </button>
+                </div>
+              </div>
+              <small v-if="vehicleCatalogError" class="vehicle-catalog-error">{{ vehicleCatalogError }}</small>
+            </section>
+            <div class="vehicle-form-grid">
+              <label class="vehicle-field"><span>品牌</span><input v-model="vehicleDraft.brand" required placeholder="例如：小鹏汽车"></label>
+              <label class="vehicle-field"><span>车系</span><input v-model="vehicleDraft.series" required placeholder="例如：小鹏 P7"></label>
+              <label class="vehicle-field"><span>具体车型 / 年款</span><input v-model="vehicleDraft.model" required placeholder="请选择搜索结果"></label>
+              <label class="vehicle-field"><span>动力类型</span><select v-model="vehicleDraft.power_type">
+                  <option value="electric">纯电</option>
+                  <option value="hybrid">混动</option>
+                  <option value="fuel">燃油</option>
+                </select></label>
+              <label class="vehicle-field"><span>额定续航（km）</span><input v-model.number="vehicleDraft.rated_range_km" type="number" min="1" placeholder="由具体年款自动填入"></label>
+              <label class="vehicle-field"><span>电池容量（kWh）</span><input v-model.number="vehicleDraft.battery_kwh" type="number" min="1" placeholder="由具体年款自动填入"></label>
+              <label class="vehicle-field"><span>当前电量（%）</span><input v-model.number="vehicleDraft.current_energy_percent" type="number" min="0" max="100" placeholder="80"></label>
+              <label class="vehicle-field"><span>百公里能耗</span><input v-model.number="vehicleDraft.consumption_per_100km" type="number" min="1" placeholder="电耗 kWh / 油耗 L"></label>
+              <label class="vehicle-field"><span>直流快充 30-80%（小时）</span><input v-model.number="vehicleDraft.dc_charge_time_hours" type="number" min="0.01" step="0.01" placeholder="公开年款有数据时自动填入"></label>
+              <label class="vehicle-field"><span>座位数</span><input v-model.number="vehicleDraft.seats" type="number" min="1" max="20" placeholder="5"></label>
+              <label class="vehicle-field"><span>安全余量（%）</span><input v-model.number="vehicleDraft.safe_energy_reserve_percent" type="number" min="5" max="40" placeholder="15"></label>
+            </div>
+            <label class="vehicle-check"><input v-model="vehicleDraft.has_etc" type="checkbox"> 已办理 ETC</label>
+            <label class="vehicle-check"><input v-model="vehicleDraft.mountain_ready" type="checkbox"> 适合山路</label>
+            <div class="vehicle-form-actions">
+              <button type="button" class="secondary-button" @click="cancelVehicleForm">取消</button>
+              <button type="submit" class="primary-button" :disabled="vehicleBusy">{{ vehicleBusy ? '保存中…' : '保存车型' }}</button>
+            </div>
+          </form>
+        </template>
+        <template v-else-if="activeMenu === '用户设置'">
+          <div v-if="auth.isAdmin" class="user-management">
+            <p class="drawer-note">管理员可以创建普通用户；新用户只能看到自己的行程、车型和附件。</p>
+            <form class="managed-user-form" @submit.prevent="createUser">
+              <label><span>显示名称</span><input v-model.trim="managedUserDisplayName" required placeholder="例如：李女士"></label>
+              <label><span>登录邮箱</span><input v-model.trim="managedUserEmail" type="email" required placeholder="name@example.com"></label>
+              <label><span>初始密码</span><input v-model="managedUserPassword" type="password" minlength="8" required placeholder="至少 8 位字符"></label>
+              <button type="submit" class="primary-button" :disabled="managedUserBusy">{{ managedUserBusy ? '创建中…' : '创建普通用户' }}</button>
+            </form>
+            <p v-if="managedUserError" class="vehicle-error">{{ managedUserError }}</p>
+            <p v-if="managedUserSuccess" class="user-success">{{ managedUserSuccess }}</p>
+            <div class="managed-user-list">
+              <div v-for="item in managedUsers" :key="item.id" class="managed-user-item">
+                <strong>{{ item.display_name }}</strong>
+                <span>{{ item.email }} · {{ item.role === 'admin' ? '管理员' : '普通用户' }}</span>
+              </div>
+            </div>
+          </div>
+          <p v-else>当前账户是普通用户，用户管理仅对管理员开放。</p>
+        </template>
+        <p v-else>这项设置暂不可用。车辆与用户管理可从账户菜单打开。</p>
+      </aside>
+    </Transition>
+  </main>
+</template>
