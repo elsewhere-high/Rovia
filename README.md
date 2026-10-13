@@ -4,6 +4,11 @@
 
 ![Rovia 旅行工作台](docs/images/home.png)
 
+## 2026 上海开源大赛
+
+参赛赛道：开源 AI 工具。查看 [作品介绍 PDF、演示视频与提交材料](https://github.com/elsewhere-high/Rovia/releases/tag/os2026-v1.0)。
+视频使用明确标注的内置示例行程，展示实际界面与后端操作；复现方式及验证结果见 [参赛说明](docs/competition/README.md)。
+
 ## 功能
 
 - 规划前集中澄清日期、目的地和出行约束，再确认开始规划。
@@ -46,6 +51,7 @@ conda run --no-capture-output -n rovia python scripts/dev.py
 - [开发、验证与配置](docs/development.md)
 - [架构与功能边界](docs/architecture.md)
 - [接口说明](docs/api.md)，运行后也可访问 <http://127.0.0.1:8000/docs>
+- [贡献说明](CONTRIBUTING.md)
 
 ## 许可
 

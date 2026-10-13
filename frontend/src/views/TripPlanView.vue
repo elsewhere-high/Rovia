@@ -453,16 +453,30 @@ async function requestActivityRemoval(activityId: string) {
   }
 }
 
-async function saveVersion() {
+const versionEditorOpen = ref(false)
+const versionName = ref('')
+const versionSaving = ref(false)
+
+function openVersionEditor() {
   if (!store.trip || store.trip.id === 'trip_wuhan_lushan_demo') return
-  const name = window.prompt('版本名称', `行程版本 ${new Date().toLocaleString('zh-CN')}`)?.trim()
+  versionName.value = `行程版本 ${new Date().toLocaleString('zh-CN')}`
+  versionEditorOpen.value = true
+}
+
+async function saveVersion() {
+  if (!store.trip || versionSaving.value) return
+  const name = versionName.value.trim()
   if (!name) return
+  versionSaving.value = true
   try {
     const version = await createTripVersion(store.trip.id, name)
+    versionEditorOpen.value = false
     versionMessage.value = `已保存版本：${version.name}`
     window.setTimeout(() => { versionMessage.value = '' }, 3000)
   } catch (error) {
     versionMessage.value = error instanceof Error ? error.message : '版本保存失败'
+  } finally {
+    versionSaving.value = false
   }
 }
 
@@ -882,7 +896,7 @@ watch(bottomPanelCollapsed, (collapsed) => window.localStorage.setItem(panelStor
         <h1>{{ store.trip?.title || '自驾游深度规划页' }}</h1>
       </div>
       <div class="top-actions">
-        <button class="ghost-button" @click="saveVersion"><Share2 />保存版本</button>
+        <button class="ghost-button" @click="openVersionEditor"><Share2 />保存版本</button>
         <template v-if="planningComplete">
           <button class="ghost-button" @click="exportMarkdown"><Download />导出 Markdown</button>
           <button class="ghost-button export-small" @click="exportSnapshot('pdf')">PDF</button>
@@ -895,6 +909,11 @@ watch(bottomPanelCollapsed, (collapsed) => window.localStorage.setItem(panelStor
       </div>
     </header>
     <div v-if="versionMessage" class="degraded-banner">{{ versionMessage }}</div>
+    <form v-if="versionEditorOpen" class="attachment-preview glass-card" aria-label="保存行程版本" @submit.prevent="saveVersion">
+      <label>版本名称 <input v-model="versionName" maxlength="100" required :disabled="versionSaving" aria-label="版本名称"></label>
+      <button class="primary-button" type="submit" :disabled="versionSaving || !versionName.trim()">{{ versionSaving ? '保存中…' : '确认保存版本' }}</button>
+      <button class="secondary-button" type="button" :disabled="versionSaving" @click="versionEditorOpen = false">取消</button>
+    </form>
     <section v-if="attachmentPreview || attachmentMessage" class="attachment-preview glass-card">
       <div class="attachment-preview-heading"><strong>附件解析预览</strong><span>{{ attachmentMessage }}</span></div>
       <div v-if="attachmentPreview" class="attachment-place-list">

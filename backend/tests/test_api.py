@@ -532,7 +532,8 @@ async def test_preflight_blocks_agent_extracted_trip_over_twenty_days(client):
 
 
 @pytest.mark.asyncio
-async def test_preflight_warns_but_allows_seven_to_twenty_days(client):
+async def test_preflight_warns_but_allows_seven_to_twenty_days(client, monkeypatch):
+    monkeypatch.setattr("app.api.trips._local_today", lambda: date(2026, 9, 1))
     raw_text = "国庆从武汉到杭州玩7天"
     response = await client.post(
         "/api/v1/trips/preflight",
@@ -559,7 +560,8 @@ async def test_preflight_warns_but_allows_seven_to_twenty_days(client):
 
 
 @pytest.mark.asyncio
-async def test_duration_limit_answer_replaces_agent_extracted_long_duration(client):
+async def test_duration_limit_answer_replaces_agent_extracted_long_duration(client, monkeypatch):
+    monkeypatch.setattr("app.api.trips._local_today", lambda: date(2026, 9, 1))
     raw_text = "北京到上海277天自驾"
     response = await client.post(
         "/api/v1/trips/preflight",
